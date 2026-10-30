@@ -14,7 +14,7 @@ CADDY_BIN="$MERURU_HOME/bin/caddy"
 CADDY_DIR="$MERURU_HOME/caddy"
 CADDY_SERVICE=/etc/systemd/system/meruru-caddy.service
 COMMAND_DIR=/usr/local/bin
-MERURU_VERSION=1.0.1
+MERURU_VERSION=1.0.2
 UPDATE_URL=https://raw.githubusercontent.com/shinkumiyo/itsmeruru/main/meruru
 LEGACY_HOME=/etc/sbx
 LEGACY_SERVICE=/etc/systemd/system/sbx.service
@@ -921,11 +921,13 @@ sni_revalidate() { # Build a fresh database: failures disappear, successes retai
   while IFS=$'\t' read -r d category source purpose ip rtt verified; do echo -e "${CYA}复测：$d（原 RTT ${rtt}ms）${OFF}"; SNI_CATEGORY="$category"; SNI_PURPOSE="$purpose"; sni_probe "$d" "$source" || echo '  已从活跃候选中移除。'; done <"$bak"
   rm -f "$bak"; sni_sort_active; echo '复测完成：不合格项已从活跃候选库移除，详情已写入本次归档。'
 }
+sni_host_reachable() { timeout 1 bash -c 'exec 3<>"/dev/tcp/$1/443"' _ "$1" 2>/dev/null; }
 sni_network_notice() {
   local cidr confirm addr prefix a b c d number mask base total host ip cert names domain count=0 passed=0 tested=0 existing choice endpoint
   local SNI_EXPECT_IP= SNI_SCAN_SCOPE= SNI_CATEGORY=冷门可信 SNI_PURPOSE= SNI_ARCHIVE=
   echo '  授权网段探测 · 自动定位 IPv4 网段 · 最多 3 个合格域名'
   echo '  只探测选定网段的 TCP 443；从默认 TLS 证书和 PTR 提取域名。'
+  echo '  逐个地址显示进度；无响应的 443 端口最多等待约 1 秒。'
   echo '  VPS 服务商可能限制探测；仅扫描你拥有或已获明确授权的地址。'
   addr=
   for endpoint in https://api.ipify.org https://icanhazip.com; do
@@ -953,11 +955,13 @@ sni_network_notice() {
   for ((host=1;host<total-1;host++)); do
     number=$((base+host)); ip="$((number>>24 & 255)).$((number>>16 & 255)).$((number>>8 & 255)).$((number & 255))"
     [ "$ip" != "$addr" ] || continue
-    count=$((count+1)); [ $((count%16)) -ne 0 ] || echo "  已探测 $count / $((total-2)) 个地址，合格 $passed / 3"
+    count=$((count+1))
+    echo "  [$count/$((total-2))] 探测 $ip:443 · 合格 $passed/3"
+    if ! sni_host_reachable "$ip"; then sleep 0.1; continue; fi
     : >"$names"
     timeout 2 openssl s_client -connect "$ip:443" -noservername -showcerts -tls1_3 </dev/null >"$cert" 2>/dev/null || true
     openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null | grep -Eo 'DNS:[A-Za-z0-9.-]+' | cut -c5- >>"$names" || true
-    dig +time=1 +tries=1 +short -x "$ip" 2>/dev/null | sed 's/\.$//' >>"$names" || true
+    timeout 3 dig +time=1 +tries=1 +short -x "$ip" 2>/dev/null | sed 's/\.$//' >>"$names" || true
     local per_ip=0
     while IFS= read -r domain; do
       domain=${domain,,}; [[ "$domain" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}$ ]] || continue

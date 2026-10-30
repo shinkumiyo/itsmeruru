@@ -14,7 +14,7 @@ CADDY_BIN="$MERURU_HOME/bin/caddy"
 CADDY_DIR="$MERURU_HOME/caddy"
 CADDY_SERVICE=/etc/systemd/system/meruru-caddy.service
 COMMAND_DIR=/usr/local/bin
-MERURU_VERSION=1.0.6
+MERURU_VERSION=1.0.7
 UPDATE_URL=https://raw.githubusercontent.com/shinkumiyo/itsmeruru/main/meruru
 LEGACY_HOME=/etc/sbx
 LEGACY_SERVICE=/etc/systemd/system/sbx.service
@@ -219,7 +219,7 @@ EOF
 }
 
 check_commit() { # node file is already staged; delete it if merged config is invalid
-  local f=$1 err n m active=0 ws=0
+  local f=$1 err n m active=0 ws=0 rollback_failed=0 recovery
   n=$(basename "$f" .json); m="$META/$n.meta"
   systemctl is-active --quiet meruru.service && active=1
   err=$(mktemp)
@@ -229,10 +229,16 @@ check_commit() { # node file is already staged; delete it if merged config is in
   rm -f "$err"
   [ "$(jq -r .type "$m")" != vless-ws ] || ws=1
   if ! restart || ! network_open "$m" || { [ "$ws" = 1 ] && ! caddy_ws_sync; }; then
-    network_remove_delta "$m" /dev/null || true
-    rm -f "$f" "$m" "$MERURU_HOME/certs/$n.crt" "$MERURU_HOME/certs/$n.key"
-    [ "$ws" = 0 ] || caddy_ws_sync || true
-    if [ "$active" = 1 ]; then restart; else systemctl stop meruru.service; fi
+    recovery=$(mktemp -d "$MERURU_HOME/.create-backup.XXXXXX") || { die '创建失败且无法备份临时配置；请检查服务和节点文件。'; return 1; }
+    cp -p "$f" "$m" "$recovery/" || { die "创建失败，无法备份临时配置；请检查：$recovery"; return 1; }
+    network_remove_delta "$m" /dev/null || rollback_failed=1
+    rm -f "$f" "$m" "$MERURU_HOME/certs/$n.crt" "$MERURU_HOME/certs/$n.key" || rollback_failed=1
+    [ "$ws" = 0 ] || caddy_ws_sync || rollback_failed=1
+    if [ "$active" = 1 ]; then restart || rollback_failed=1; else systemctl stop meruru.service || rollback_failed=1; fi
+    if [ "$rollback_failed" = 1 ]; then
+      die "创建失败且回滚未完全成功，请检查服务和防火墙；临时配置备份：$recovery"; return 1
+    fi
+    rm -rf "$recovery"
     die '创建失败；已移除新节点并恢复原运行状态。'; return 1
   fi
   echo -e "${GRN}Saved and started.${OFF}"
@@ -635,6 +641,9 @@ select_candidate_sni() { # $1 category
   while IFS=$'\t' read -r d category source purpose ip rtt verified; do
     if [ "$wanted" = custom ]; then [ "$source" = import ] || continue
     else [ "$source" != import ] && [ "$category" = "$wanted" ] || continue; fi
+    if [ "$wanted" = 热门可信 ]; then
+      case "$source" in popular-owned|popular-verified) :;; *) continue;; esac
+    fi
     [[ "$rtt" =~ ^[0-9]+([.][0-9]+)?$ ]] || continue
     domains+=("$d")
     ui_item "${#domains[@]}" "$d  · RTT ${rtt}ms"
@@ -995,6 +1004,9 @@ sni_view() {
       if [[ "$rtt" =~ ^[0-9]+([.][0-9]+)?$ ]] && [[ "$ip" =~ ^[0-9.]+$ ]]; then
         measured=$((measured+1)); printf '  %s  [%s]  RTT: %sms\n    用途：%s\n    来源：%s  IP：%s  复测：%s\n' "$d" "$category" "$rtt" "$purpose" "$source" "$ip" "$verified"
         [ "$source" != popular-owned ] || echo '    旧热门记录，尚未验证官方网络归属。'
+        if [ "$category" = 热门可信 ] && [ "$source" != import ] && [ "$source" != popular-owned ] && [ "$source" != popular-verified ]; then
+          echo '    旧来源未核验官方网络归属，不会出现在热门节点选择中。'
+        fi
         sni_history_summary "$d"
       else
         pending=$((pending+1))
@@ -1377,7 +1389,7 @@ delete_node() {
   esac
 }
 delete_nodes_transaction() {
-  local backup n active=0 failed=0 ws=0
+  local backup n active=0 failed=0 ws=0 rollback_failed=0
   backup=$(mktemp -d "$MERURU_HOME/.delete-backup.XXXXXX") || return 1
   mkdir -p "$backup/conf" "$backup/meta" "$backup/certs" || return 1
   for n in "$@"; do
@@ -1397,9 +1409,16 @@ delete_nodes_transaction() {
     for n in "$@"; do network_remove_delta "$backup/meta/$n.meta" /dev/null || { failed=1; break; }; done
   fi
   if [ "$failed" = 1 ]; then
-    for n in "$@"; do cp -p "$backup/conf/$n.json" "$CONF/"; cp -p "$backup/meta/$n.meta" "$META/"; network_open "$META/$n.meta"; done
-    [ "$ws" = 0 ] || caddy_ws_sync
-    [ "$active" = 0 ] || restart
+    for n in "$@"; do
+      cp -p "$backup/conf/$n.json" "$CONF/" || rollback_failed=1
+      cp -p "$backup/meta/$n.meta" "$META/" || rollback_failed=1
+      network_open "$backup/meta/$n.meta" || rollback_failed=1
+    done
+    [ "$ws" = 0 ] || caddy_ws_sync || rollback_failed=1
+    [ "$active" = 0 ] || restart || rollback_failed=1
+    if [ "$rollback_failed" = 1 ]; then
+      die "删除失败且回滚未完全成功，请检查服务和防火墙；原始备份：$backup"; return 1
+    fi
     die "删除未完成，已恢复原节点；备份：$backup"; return 1
   fi
   for n in "$@"; do rm -f "$MERURU_HOME/certs/$n.crt" "$MERURU_HOME/certs/$n.key"; done

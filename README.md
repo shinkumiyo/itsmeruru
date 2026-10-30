@@ -33,6 +33,7 @@ wget -O /root/meruru https://raw.githubusercontent.com/shinkumiyo/itsmeruru/main
 - 主菜单 **16 → 检查更新**：更新管理脚本、sing-box 或 Caddy；支持回退上一版管理脚本。
 - 更新内核前检查节点配置兼容性；启动失败会尝试恢复旧程序。停止的服务不会因更新而自动启动。
 - 主菜单 **14 → 运行管理**：管理节点服务和 Caddy，查看状态与日志。
+- 旧 TUIC 节点需要补齐 ALPN 时，可在运行管理中手动选择修复；管理脚本更新不会自动修改这些节点或因此重启服务。
 - 配置目录：`/etc/meruru`；服务名：`meruru.service`、`meruru-caddy.service`。
 - 配置损坏时进入恢复模式，可查看日志、隔离节点配置；`meruru-rollback` 可独立回退上一版管理脚本。
 - 管理操作使用单会话锁，避免多个 SSH 面板同时修改节点；RTT 阈值会自动保存。

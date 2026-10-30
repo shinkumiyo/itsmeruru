@@ -46,6 +46,7 @@ wget -O /root/meruru https://raw.githubusercontent.com/shinkumiyo/itsmeruru/main
 - 冷门和热门 SNI 使用中国大陆网站屏蔽名单辅助筛查；已知存在 SNI 屏蔽的 google.com 及其子域名排除。热门品牌域名命中网站名单时提示风险并继续检测，仍须通过网络归属等检查；名单命中不等于 SNI 必然被拦截。
 - VPS 上的探测不能证明国内 SNI 可达。请从实际使用的国内网络测试建好的节点；浏览器能否打开网站也不能代替节点测试。列表中的旧候选不会在更新时自动删除。
 - SNI 的 RTT 为三次 TCP 建连中位数；TLS 建连耗时为单次测量（包含 TCP），并显示服务端发送的证书数量。这些是独立指标，不代表国内端到端连接时延。
+- CDN 筛查包括 CNAME、响应头和 Cloudflare 公布的 IPv4 网段；网段数据不可用时保留旧候选并暂停判定。HTTP 跳转只显示目标主机，不跟随跳转替换 SNI。
 - 热门候选结合官方页面与网络归属资料更新：Apple、Google、Microsoft 使用网络范围，Tesla、Intel、NVIDIA、HP、Cisco 使用 RIPE 路由 ASN 证据。路由归属不能证明 CDN 专属或禁止域前置，其他品牌暂不作归属保证。
 - 回落过滤默认关闭，仅拒绝不匹配或缺失的明文 SNI；无法检查加密后的 HTTP Host，也不能完全防止利用相同 SNI 的回落流量。已有节点不会自动开启。
 - 节点配置包含密码和密钥，请妥善备份，不要公开上传。

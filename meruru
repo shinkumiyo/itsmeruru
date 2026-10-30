@@ -14,7 +14,7 @@ CADDY_BIN="$MERURU_HOME/bin/caddy"
 CADDY_DIR="$MERURU_HOME/caddy"
 CADDY_SERVICE=/etc/systemd/system/meruru-caddy.service
 COMMAND_DIR=/usr/local/bin
-MERURU_VERSION=1.0.2
+MERURU_VERSION=1.0.3
 UPDATE_URL=https://raw.githubusercontent.com/shinkumiyo/itsmeruru/main/meruru
 LEGACY_HOME=/etc/sbx
 LEGACY_SERVICE=/etc/systemd/system/sbx.service
@@ -923,12 +923,13 @@ sni_revalidate() { # Build a fresh database: failures disappear, successes retai
 }
 sni_host_reachable() { timeout 1 bash -c 'exec 3<>"/dev/tcp/$1/443"' _ "$1" 2>/dev/null; }
 sni_network_notice() {
-  local cidr confirm addr prefix a b c d number mask base total host ip cert names domain count=0 passed=0 tested=0 existing choice endpoint
+  local cidr confirm addr prefix a b c d number mask base total host ip cert names domain count=0 passed=0 tested=0 existing choice endpoint max_hosts
   local SNI_EXPECT_IP= SNI_SCAN_SCOPE= SNI_CATEGORY=冷门可信 SNI_PURPOSE= SNI_ARCHIVE=
   echo '  授权网段探测 · 自动定位 IPv4 网段 · 最多 3 个合格域名'
   echo '  只探测选定网段的 TCP 443；从默认 TLS 证书和 PTR 提取域名。'
   echo '  逐个地址显示进度；无响应的 443 端口最多等待约 1 秒。'
   echo '  VPS 服务商可能限制探测；仅扫描你拥有或已获明确授权的地址。'
+  echo '  即使低频探测也可能触发告警；请先确认服务商允许该操作。'
   addr=
   for endpoint in https://api.ipify.org https://icanhazip.com; do
     addr=$(curl -4fsS --connect-timeout 2 --max-time 4 "$endpoint" 2>/dev/null | tr -d '[:space:]')
@@ -939,14 +940,16 @@ sni_network_notice() {
   [[ "$addr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
   a=$((10#${BASH_REMATCH[1]})); b=$((10#${BASH_REMATCH[2]})); c=$((10#${BASH_REMATCH[3]})); d=$((10#${BASH_REMATCH[4]}))
   echo "  本机公网 IPv4：$addr"
-  ui_item 1 '本机 /24    最多 254 个地址（默认）'
-  ui_item 2 '周边 /23    最多 510 个地址'
-  ui_item 3 '周边 /22    最多 1022 个地址'
-  read -r -p '  范围 [1]（0 取消）：' choice || return 1
-  case "${choice:-1}" in 1)prefix=24;;2)prefix=23;;3)prefix=22;;0)return 0;;*)die '范围编号无效。'; return 1;;esac
+  ui_item 1 '轻量    最多 16 个地址（默认）'
+  ui_item 2 '适中    最多 32 个地址'
+  ui_item 3 '扩展    最多 64 个地址'
+  read -r -p '  探测数量 [1]（0 取消）：' choice || return 1
+  case "${choice:-1}" in 1)max_hosts=16;;2)max_hosts=32;;3)max_hosts=64;;0)return 0;;*)die '数量编号无效。'; return 1;;esac
+  prefix=24
   number=$(( (a<<24) | (b<<16) | (c<<8) | d )); total=$((1 << (32-prefix))); mask=$((total-1)); base=$((number & ~mask))
   cidr="$((base>>24 & 255)).$((base>>16 & 255)).$((base>>8 & 255)).$((base & 255))/$prefix"
-  echo "  范围：$cidr；最多探测 $((total-2)) 个主机，每个地址最多验证 4 个域名。"
+  echo "  范围：$cidr；最多探测 $max_hosts 个主机，单线程，每个地址最多验证 4 个域名。"
+  echo '  每个地址结束后等待 1 秒；发现域名后还会进行多次连接以验证。'
   echo '  域名需解析到正在探测的地址，并通过现有 RTT、TLS、CDN 和屏蔽名单筛选。'
   read -r -p '  确认拥有该网段的探测授权并开始？[y/N] ' confirm || return 1
   [[ "$confirm" =~ ^[Yy]$ ]] || { echo '  已取消。'; return 0; }
@@ -956,8 +959,8 @@ sni_network_notice() {
     number=$((base+host)); ip="$((number>>24 & 255)).$((number>>16 & 255)).$((number>>8 & 255)).$((number & 255))"
     [ "$ip" != "$addr" ] || continue
     count=$((count+1))
-    echo "  [$count/$((total-2))] 探测 $ip:443 · 合格 $passed/3"
-    if ! sni_host_reachable "$ip"; then sleep 0.1; continue; fi
+    echo "  [$count/$max_hosts] 探测 $ip:443 · 合格 $passed/3"
+    if ! sni_host_reachable "$ip"; then [ "$count" -lt "$max_hosts" ] || break; sleep 1; continue; fi
     : >"$names"
     timeout 2 openssl s_client -connect "$ip:443" -noservername -showcerts -tls1_3 </dev/null >"$cert" 2>/dev/null || true
     openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null | grep -Eo 'DNS:[A-Za-z0-9.-]+' | cut -c5- >>"$names" || true
@@ -973,8 +976,8 @@ sni_network_notice() {
       if sni_probe "$domain" authorized-cidr; then passed=$((passed+1)); fi
       [ "$passed" -lt 3 ] && [ "$per_ip" -lt 4 ] || break
     done < <(sort -fu "$names")
-    [ "$passed" -lt 3 ] || break
-    sleep 0.1
+    [ "$passed" -lt 3 ] && [ "$count" -lt "$max_hosts" ] || break
+    sleep 1
   done
   rm -f "$cert" "$names"; sni_sort_active
   echo "  完成：探测 $count 个地址，验证 $tested 个域名，新增 $passed / 3 个候选。"

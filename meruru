@@ -14,7 +14,7 @@ CADDY_BIN="$MERURU_HOME/bin/caddy"
 CADDY_DIR="$MERURU_HOME/caddy"
 CADDY_SERVICE=/etc/systemd/system/meruru-caddy.service
 COMMAND_DIR=/usr/local/bin
-MERURU_VERSION=1.0.5
+MERURU_VERSION=1.0.6
 UPDATE_URL=https://raw.githubusercontent.com/shinkumiyo/itsmeruru/main/meruru
 LEGACY_HOME=/etc/sbx
 LEGACY_SERVICE=/etc/systemd/system/sbx.service
@@ -240,8 +240,19 @@ check_commit() { # node file is already staged; delete it if merged config is in
 check_node_pair() { # A syntax-valid config is not enough: the share metadata must describe that config.
   local n=$1
   jq -e -s '
-    length==2 and (.[0].inbounds|length)==1 and
+    length==2 and
     (.[0].inbounds[0] as $i | .[1] as $m |
+      (.[0] as $cfg |
+       if ($m.guard_port // 0)>0 then
+         ($cfg.inbounds|length)==2 and $cfg.inbounds[1].type=="direct" and
+         $cfg.inbounds[1].tag==($m.name+"-sni-guard") and $cfg.inbounds[1].listen=="127.0.0.1" and
+         $cfg.inbounds[1].listen_port==$m.guard_port and $cfg.inbounds[1].network=="tcp" and
+         $cfg.inbounds[1].override_address=="192.0.2.1" and $cfg.inbounds[1].override_port==1 and
+         $cfg.route.rules==[
+           {inbound:[($m.name+"-sni-guard")],action:"sniff",sniffer:["tls"],timeout:"3s"},
+           {inbound:[($m.name+"-sni-guard")],domain:[$m.domain],action:"route",outbound:"direct",override_address:$m.domain,override_port:$m.guard_target_port},
+           {inbound:[($m.name+"-sni-guard")],action:"reject"}]
+       else ($cfg.inbounds|length)==1 end) and
       ($m.port|type)=="number" and $i.listen_port==$m.port and
       ($i.type==(if $m.type=="vless-ws" then "vless" else $m.type end)) and
       (if $m.type=="vless" or $m.type=="vless-ws" then $i.users[0].uuid==$m.uuid and ($m.uuid|type)=="string"
@@ -250,7 +261,7 @@ check_node_pair() { # A syntax-valid config is not enough: the share metadata mu
        elif $m.type=="direct" then $i.override_address==$m.host and $i.override_port==$m.target_port
        elif $m.type=="anytls" or $m.type=="hysteria2" or $m.type=="trojan" then $i.users[0].password==$m.password
        else false end) and
-      (if $m.type=="vless" or $m.type=="anytls" then $i.tls.server_name==$m.domain and $i.tls.reality.handshake.server==$m.domain and $i.tls.reality.short_id[0]==$m.sid
+      (if $m.type=="vless" or $m.type=="anytls" then $i.tls.server_name==$m.domain and $i.tls.reality.handshake.server==(if ($m.guard_port//0)>0 then "127.0.0.1" else $m.domain end) and (($m.guard_port//0)==0 or $i.tls.reality.handshake.server_port==$m.guard_port) and $i.tls.reality.short_id[0]==$m.sid
        elif $m.type=="vless-ws" then $i.transport.path==$m.path else true end))
   ' "$CONF/$n.json" "$META/$n.meta" >/dev/null || { die '节点配置与分享信息不一致或未完整写入。'; return 1; }
 }
@@ -337,6 +348,8 @@ hop_range_free() { # $1 first port, $2 last port: avoid all existing listeners a
   for m in "$META"/*.meta; do
     [ -f "$m" ] || continue
     [ "$m" != "$META/$owner.meta" ] || continue
+    p=$(jq -r '.guard_port // 0' "$m")
+    [ "$p" -ge "$first" ] && [ "$p" -le "$last" ] && return 1
     p=$(jq -r '.port // 0' "$m")
     [ "$p" -ge "$first" ] && [ "$p" -le "$last" ] && return 1
     h=$(jq -r '.hop // empty' "$m"); [ -n "$h" ] || continue; IFS=- read -r hs he <<<"$h"
@@ -480,6 +493,7 @@ sni_history_record() { # Latest result + cumulative counts, bound to the probing
     3:*) reason=tls; ttl=86400;;
     5:*) reason=blocklist; ttl=21600;;
     6:*) reason=cdn_check_unavailable; ttl=600;;
+    7:*) reason=owner_unverified; ttl=600;;
     *DNS*) reason=dns; ttl=3600;;
     *) reason=connect; ttl=1800;;
   esac
@@ -501,12 +515,80 @@ sni_history_summary() {
   [ -s "$MERURU_HOME/sni-history.json" ] || return 0
   jq -r --arg d "$1" '.[$d] | select(.!=null) | "    历史：通过 \(.passes) / 失败 \(.failures) · RTT \(.rtt_min // "—")–\(.rtt_max // "—") ms · 最近 \(.reason)" + (if (.passes+.failures)<3 then " · 样本不足" else "" end)' "$MERURU_HOME/sni-history.json"
 }
+sni_ip_in_prefixes() { # IPv4 membership; paths contain one canonical CIDR per line.
+  local ip=$1 file=$2 a b c d num prefix bits net n1 n2 n3 n4 n mask
+  [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  a=$((10#${BASH_REMATCH[1]})); b=$((10#${BASH_REMATCH[2]})); c=$((10#${BASH_REMATCH[3]})); d=$((10#${BASH_REMATCH[4]}))
+  [ "$a" -le 255 ] && [ "$b" -le 255 ] && [ "$c" -le 255 ] && [ "$d" -le 255 ] || return 1
+  num=$((a<<24 | b<<16 | c<<8 | d))
+  while IFS=/ read -r net bits; do
+    [[ "$bits" =~ ^[0-9]{1,2}$ ]] && [[ "$net" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || continue
+    n1=$((10#${BASH_REMATCH[1]})); n2=$((10#${BASH_REMATCH[2]})); n3=$((10#${BASH_REMATCH[3]})); n4=$((10#${BASH_REMATCH[4]})); bits=$((10#$bits))
+    [ "$n1" -le 255 ] && [ "$n2" -le 255 ] && [ "$n3" -le 255 ] && [ "$n4" -le 255 ] && [ "$bits" -le 32 ] || continue
+    n=$((n1<<24 | n2<<16 | n3<<8 | n4)); mask=$(( (0xffffffff << (32-bits)) & 0xffffffff ))
+    [ $((num & mask)) -ne $((n & mask)) ] || return 0
+  done <"$file"
+  return 1
+}
+sni_hot_owner_family() {
+  case "${1,,}" in apple.com|*.apple.com|icloud.com|*.icloud.com) echo apple;; google.com|*.google.com|googleapis.com|*.googleapis.com|gstatic.com|*.gstatic.com) echo google;; microsoft.com|*.microsoft.com|office.com|*.office.com|bing.com|*.bing.com|xbox.com|*.xbox.com|surface.com|*.surface.com) echo microsoft;; *) return 1;;esac
+}
+sni_owner_cache() { # Fresh official provider IP ranges, with no stale fallback.
+  local family=$1 dir="$MERURU_HOME/sni-owner" tmp page url
+  mkdir -p "$dir" || return 1
+  case "$family" in
+    google)
+      if [ -s "$dir/google.txt" ] && [ -s "$dir/google-cloud.txt" ] && [ -z "$(find "$dir/google.txt" "$dir/google-cloud.txt" -mmin +1440 -print 2>/dev/null)" ]; then return 0; fi
+      [ "${SNI_GOOGLE_OWNER_FAILED:-0}" = 0 ] || return 1
+      tmp=$(mktemp -d "$dir/.refresh.XXXXXX") || return 1
+      if curl -fsSL --connect-timeout 5 --max-time 25 --max-filesize 12000000 https://www.gstatic.com/ipranges/goog.json -o "$tmp/google.json" &&
+         curl -fsSL --connect-timeout 5 --max-time 25 --max-filesize 12000000 https://www.gstatic.com/ipranges/cloud.json -o "$tmp/cloud.json" &&
+         jq -e '[.prefixes[]?.ipv4Prefix // empty] | length>0 and all(.[];test("^[0-9.]+/[0-9]+$"))' "$tmp/google.json" >/dev/null &&
+         jq -e '[.prefixes[]?.ipv4Prefix // empty] | length>0 and all(.[];test("^[0-9.]+/[0-9]+$"))' "$tmp/cloud.json" >/dev/null &&
+         [ "$(jq -r '.syncToken // empty' "$tmp/google.json")" = "$(jq -r '.syncToken // "missing"' "$tmp/cloud.json")" ] &&
+         jq -r '.prefixes[]?.ipv4Prefix // empty' "$tmp/google.json" >"$tmp/google.txt" && jq -r '.prefixes[]?.ipv4Prefix // empty' "$tmp/cloud.json" >"$tmp/cloud.txt" &&
+         [ -s "$tmp/google.txt" ] && [ -s "$tmp/cloud.txt" ] && mv "$tmp/google.txt" "$dir/google.txt" && mv "$tmp/cloud.txt" "$dir/google-cloud.txt"; then rm -rf "$tmp"; return 0; fi
+      rm -rf "$tmp"; rm -f "$dir/google.txt" "$dir/google-cloud.txt"; SNI_GOOGLE_OWNER_FAILED=1; return 1;;
+    microsoft)
+      if [ -s "$dir/microsoft-firstparty.txt" ] && [ -z "$(find "$dir/microsoft-firstparty.txt" -mtime +6 -print 2>/dev/null)" ]; then return 0; fi
+      [ "${SNI_MS_OWNER_FAILED:-0}" = 0 ] || return 1
+      tmp=$(mktemp -d "$dir/.refresh.XXXXXX") || return 1
+      page=$(curl -fsSL --connect-timeout 5 --max-time 20 --max-filesize 2000000 'https://www.microsoft.com/en-us/download/confirmation.aspx?id=56519' 2>/dev/null) || page=
+      url=$(grep -Eo 'https://download\.microsoft\.com/download/[^" <>]+/ServiceTags_Public_[0-9]+\.json' <<<"$page" | head -n1)
+      if [ -n "$url" ] && curl -fsSL --connect-timeout 5 --max-time 45 --max-filesize 12000000 "$url" -o "$tmp/ms.json" &&
+         jq -r '.values[]? | select(.name=="AzureFrontDoor.FirstParty") | .properties.addressPrefixes[]? | select(test("^[0-9.]+/[0-9]+$"))' "$tmp/ms.json" >"$tmp/ms.txt" &&
+         [ -s "$tmp/ms.txt" ] && mv "$tmp/ms.txt" "$dir/microsoft-firstparty.txt"; then rm -rf "$tmp"; return 0; fi
+      rm -rf "$tmp"; SNI_MS_OWNER_FAILED=1; return 1;;
+  esac
+  return 1
+}
+sni_hot_owner_check() { # 0 supported official-range evidence, 1 not in range, 2 unavailable/unknown.
+  local family ip=$2 dir="$MERURU_HOME/sni-owner"
+  public_address_valid "$ip" || return 1
+  family=$(sni_hot_owner_family "$1") || return 2
+  case "$family" in
+    apple) [[ "$ip" =~ ^17\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1;;
+    google) sni_owner_cache google || return 2; sni_ip_in_prefixes "$ip" "$dir/google.txt" || return 1; sni_ip_in_prefixes "$ip" "$dir/google-cloud.txt" && return 1;;
+    microsoft) sni_owner_cache microsoft || return 2; sni_ip_in_prefixes "$ip" "$dir/microsoft-firstparty.txt" || return 1;;
+  esac
+  return 0
+}
 sni_probe() { # Explicit selection/revalidation always bypasses discovery's failure cache.
   # Do not call test_sni in $(...) -- that would put SNI_LAST_IP/RTT in a subshell and lose them.
   local d=$1 source=$2 detail rc probe_log list="$MERURU_HOME/sni_candidates.txt" result purpose=${SNI_PURPOSE:-"手动/未标注来源"} category=${SNI_CATEGORY:-冷门可信}
   SNI_LAST_RTT=; SNI_LAST_IP=
-  if [ "$source" = popular-owned ]; then
+  if [ "$source" = popular-owned ] || [ "$source" = popular-verified ]; then
     probe_log=$(mktemp); test_sni "$d" official >"$probe_log"; rc=$?; detail=$(<"$probe_log"); rm -f "$probe_log"
+    if [ "$rc" = 0 ]; then
+      local owner_rc=0
+      sni_hot_owner_check "$d" "$SNI_LAST_IP" || owner_rc=$?
+      case "$owner_rc" in 0)source=popular-verified; detail="$detail
+  已匹配官方网络范围（不能保证完全识别 CDN 服务商）";;
+        1)rc=2; detail="$detail
+  未匹配该品牌的已验证自有网络范围";;
+        *)rc=7; detail="$detail
+  无法取得或确认自有网络归属，本次不使用，保留已有记录";; esac
+    fi
   else
     sni_cn_reachability "$d"; rc=$?
     if [ "$rc" -eq 1 ]; then detail='  中国大陆屏蔽名单命中，未加入候选'; rc=5
@@ -515,7 +597,7 @@ sni_probe() { # Explicit selection/revalidation always bypasses discovery's fail
   fi
   echo "$detail"
   sni_history_record "$d" "$source" "$rc" "$detail"
-  if [ "$rc" -ne 0 ] && [ -s "$MERURU_HOME/sni-candidates.tsv" ]; then
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 7 ] && [ -s "$MERURU_HOME/sni-candidates.tsv" ]; then
     awk -F'\t' -v d="$d" '$1!=d' "$MERURU_HOME/sni-candidates.tsv" >"$MERURU_HOME/sni-candidates.tsv.tmp" && mv "$MERURU_HOME/sni-candidates.tsv.tmp" "$MERURU_HOME/sni-candidates.tsv"
     sni_sort_active
   fi
@@ -557,6 +639,7 @@ select_candidate_sni() { # $1 category
     domains+=("$d")
     ui_item "${#domains[@]}" "$d  · RTT ${rtt}ms"
     printf '      %s（%s，%s）\n' "$purpose" "$source" "$ip"
+    [ "$source" != popular-owned ] || echo '      旧热门记录：选择后需重新验证官方网络归属。'
     [ "$wanted" != 热门可信 ] || sni_history_summary "$d"
   done < <(sni_recommended_rows)
   [ "${#domains[@]}" -gt 0 ] || return 1
@@ -566,8 +649,9 @@ select_candidate_sni() { # $1 category
   IFS=$'\t' read -r d SNI_CATEGORY source SNI_PURPOSE ip rtt verified <<<"$selected"
   echo "建节点前复测：$DOMAIN"
   sni_archive_begin selected-retest
-  if ! sni_probe "$DOMAIN" "$source"; then
-    awk -F'\t' -v d="$DOMAIN" '$1!=d' "$db" >"$db.tmp" && mv "$db.tmp" "$db"
+  if sni_probe "$DOMAIN" "$source"; then :; else
+    local rc=$?
+    if [ "$rc" = 7 ]; then die '无法确认自有网络归属，保留旧记录但本次不能使用。'; return 2; fi
     sni_sort_active; die '复测未通过，已移除该候选，请重新选择。'; return 2
   fi
   sni_sort_active
@@ -612,6 +696,19 @@ select_reality_sni() {
     *) return 1;; esac
   echo "已选择 SNI：$DOMAIN"
 }
+sni_ror_rows() { # Independent registry of active research organisations; city-level search only.
+  local city=$1 country=$2 data
+  [[ "$city" =~ ^[A-Za-z0-9[:space:].-]{1,80}$ && "$country" =~ ^[A-Z]{2}$ ]] || return 1
+  data=$(curl -fsS --connect-timeout 5 --max-time 20 -G 'https://api.ror.org/v2/organizations' --data-urlencode "query.advanced=locations.geonames_details.name:\"$city\"" --data-urlencode "filter=locations.geonames_details.country_code:$country" 2>/dev/null) || return 1
+  jq -e '.items | type=="array"' <<<"$data" >/dev/null 2>&1 || return 1
+  jq -r --arg city "$city" --arg country "$country" '
+    .items[] | select(.status=="active") |
+    select(any(.locations[]?; ((.geonames_details.name // "")|ascii_downcase)==($city|ascii_downcase) and .geonames_details.country_code==$country)) |
+    ([.names[]? | select(.types | index("ror_display")) | .value][0] // .names[0].value // "机构") as $name |
+    .links[]? | select(.type=="website" and (.value|type)=="string") |
+    [.value,"ror",($name+"（"+$city+", "+$country+"）官方主页")] | @tsv
+  ' <<<"$data"
+}
 sni_institution_discovery() {
   local geo city country data line name url kind host ip rtt verified confirm tested=0 passed=0 list="$MERURU_HOME/sni_candidates.txt" max=120
   geo=$(curl -fsS --max-time 8 https://ipapi.co/json/ 2>/dev/null || true)
@@ -634,7 +731,7 @@ sni_institution_discovery() {
   region=$(jq -r '.region // empty' <<<"$geo" 2>/dev/null)
   [[ "$country" =~ ^[A-Za-z]{2}$ ]] || { read -r -p '国家代码（如 US）：' country; }
   [[ "$country" =~ ^[A-Za-z]{2}$ ]] || { die '国家代码无效。'; return 1; }; country=${country^^}
-  echo "可信来源：OpenAlex 机构 + PeeringDB 数据中心官网。位置：$city, $country"
+  echo "可信来源：OpenAlex + ROR 机构 + PeeringDB 数据中心官网。位置：$city, $country"
   echo "历史复测 → 同城 → 同地区 → 同国家；合格 10 个即停止，最多实测 $max 个。"
   echo "机构位置仅决定顺序，最终仍要求三次 TCP 握手中位数 ≤ ${SNI_MAX_RTT_MS}ms。"
   read -r -p '确认开始扫描？[Y/n] ' confirm || return 1; [[ -z "$confirm" || "$confirm" =~ ^[Yy]$ ]] || return
@@ -670,6 +767,11 @@ sni_institution_discovery() {
         jq -r '.data[] | select(.website!=null and .website!="") | [.website,"peeringdb",(.name+"（数据中心；"+(.city//"未知城市")+"）官方主页")] | @tsv' <<<"$data" >>"$rows"
       else echo '  PeeringDB 当前层级不可用，继续已有来源。'; fi
     fi
+    if [ "$tier" = city ]; then
+      sni_ror_rows "$city" "$country" >>"$rows" || echo '  ROR 同城来源不可用，继续其他来源。'
+    fi
+    # Interleave registries so an early success limit does not starve later sources.
+    awk -F'\t' 'BEGIN{OFS="\t"} {print ++seen[$2],$0}' "$rows" | sort -t$'\t' -k1,1n -s | cut -f2- >"$rows.mixed" && mv "$rows.mixed" "$rows"
     while IFS=$'\t' read -r url source name; do
       host=$(sed -E 's#^https?://([^/:]+).*#\1#' <<<"$url" | tr '[:upper:]' '[:lower:]')
       [[ "$host" =~ ^[a-z0-9.-]+$ && "$host" != *.cn && "$host" != cn ]] || continue
@@ -720,11 +822,23 @@ sni_tranco_search() { # historical function name; Majestic is deliberately the r
   [ "$tested" -gt 0 ] || { die "Majestic 排名中没有符合业务预筛选的 $low–$high 候选。"; return; }
   echo -e "${GRN}完成：测试 $tested 个，新增/确认 $passed 个候选。归档：$SNI_ARCHIVE${OFF}"
 }
-sni_hot_discovery() { # Explicit recognisable organisations only; never scrape/populate from an arbitrary rank list.
-  local item host purpose category source ip rtt verified confirm tested=0 passed=0 total pool cached=0
+sni_hot_expand_official() { # Only exact approved vendor suffixes; no random rankings or IP scanning.
+  local pool=$1 url body host
+  for url in https://www.apple.com/ https://support.apple.com/ https://www.microsoft.com/ https://www.google.com/; do
+    body=$(curl -fsSL --connect-timeout 3 --max-time 10 --max-filesize 2000000 "$url" 2>/dev/null) || continue
+    while IFS= read -r host; do
+      host=${host,,}; sni_hot_owner_family "$host" >/dev/null || continue
+      printf '%s\t%s\n' "$host" '厂商官网引用的域名；具体用途需核实' >>"$pool"
+    done < <(grep -Eo 'https://[A-Za-z0-9.-]+' <<<"$body" | sed 's#^https://##' | sort -fu | head -n 30)
+  done
+}
+sni_hot_discovery() { # Brand suffix plus official provider IP-range evidence required.
+  local item host purpose category source ip rtt verified confirm tested=0 passed=0 total pool cached=0 unsupported=0
   echo -e "${YEL}热门可信候选：检测知名企业的官方入口，不使用随机排名站点或来源不明域名。${OFF}"
   echo '须通过 TLS、H2、X25519、第三方 CDN 与 RTT 检测；热门池按现有策略跳过屏蔽名单。'
   echo '推荐综合三次握手中位数、历史通过/失败次数和延迟波动；新域名标记为样本不足。'
+  echo '仅接受 Apple、Google 和 Microsoft 中可匹配官方网络范围的入口；其他品牌暂不作归属保证。'
+  echo '官方 IP 范围是归属证据，并不能证明完全不存在共享 CDN 或域名前置。'
   read -r -p '确认开始扫描？[Y/n] ' confirm || return 1; [[ -z "$confirm" || "$confirm" =~ ^[Yy]$ ]] || return; sni_archive_begin popular-owned || return 1
   SNI_SCAN_SCOPE="popular/$(public_ip)"
   pool=$(mktemp)
@@ -817,9 +931,21 @@ www.se.com	Schneider Electric 官方产品入口
 www.lego.com	LEGO 官方网站
 www.nintendo.com	Nintendo 官方网站
 www.playstation.com	Sony PlayStation 官方网站
+www.google.com	Google 官方网站
+support.google.com	Google 官方帮助中心
+developers.google.com	Google 官方开发者中心
 EOF
+  unset SNI_GOOGLE_OWNER_FAILED SNI_MS_OWNER_FAILED
+  echo '  从厂商官网获取新增入口，并检查官方网络范围 …'
+  sni_hot_expand_official "$pool"
   # One brand may have many entries; deduplicate hostnames before measuring.
   awk -F'\t' '!seen[$1]++' "$pool" >"$pool.unique"; mv "$pool.unique" "$pool"
+  : >"$pool.supported"
+  while IFS=$'\t' read -r host purpose; do
+    if sni_hot_owner_family "$host" >/dev/null; then printf '%s\t%s\n' "$host" "$purpose" >>"$pool.supported"; else unsupported=$((unsupported+1)); fi
+  done <"$pool"
+  mv "$pool.supported" "$pool"
+  echo "  暂跳过 $unsupported 个缺少可核实官方网络范围的其他品牌入口。"
   total=$(wc -l <"$pool")
   while IFS=$'\t' read -r host purpose; do
     if sni_cached_failure "$host"; then
@@ -833,7 +959,7 @@ EOF
   sni_sort_active
   echo -e "${GRN}完成：实测 $tested，合格 $passed，缓存跳过 $cached。以下按延迟与历史稳定性推荐：${OFF}"
   while IFS=$'\t' read -r host category source purpose ip rtt verified; do
-    [ "$category" = 热门可信 ] && [ "$source" = popular-owned ] || continue
+    [ "$category" = 热门可信 ] && [ "$source" = popular-verified ] || continue
     printf '  %s · %sms · %s\n' "$host" "$rtt" "$purpose"; sni_history_summary "$host"
   done < <(sni_recommended_rows)
 }
@@ -868,6 +994,7 @@ sni_view() {
       else [ "$source" != import ] && [ "$category" = "$group" ] || continue; fi
       if [[ "$rtt" =~ ^[0-9]+([.][0-9]+)?$ ]] && [[ "$ip" =~ ^[0-9.]+$ ]]; then
         measured=$((measured+1)); printf '  %s  [%s]  RTT: %sms\n    用途：%s\n    来源：%s  IP：%s  复测：%s\n' "$d" "$category" "$rtt" "$purpose" "$source" "$ip" "$verified"
+        [ "$source" != popular-owned ] || echo '    旧热门记录，尚未验证官方网络归属。'
         sni_history_summary "$d"
       else
         pending=$((pending+1))
@@ -917,8 +1044,11 @@ sni_revalidate() { # Build a fresh database: failures disappear, successes retai
   sni_normalize_db; [ -s "$db" ] || { echo '暂无候选。'; return; }; read -r -p '确认重新验证全部候选？[Y/n] ' confirm || return 1; [[ -z "$confirm" || "$confirm" =~ ^[Yy]$ ]] || return
   sni_archive_begin revalidate && cp "$db" "$bak" || return 1
   # Update each result in place; interruption must not discard all untested candidates.
-  while IFS=$'\t' read -r d category source purpose ip rtt verified; do echo -e "${CYA}复测：$d（原 RTT ${rtt}ms）${OFF}"; SNI_CATEGORY="$category"; SNI_PURPOSE="$purpose"; sni_probe "$d" "$source" || echo '  已从活跃候选中移除。'; done <"$bak"
-  rm -f "$bak"; sni_sort_active; echo '复测完成：不合格项已从活跃候选库移除，详情已写入本次归档。'
+  while IFS=$'\t' read -r d category source purpose ip rtt verified; do
+    echo -e "${CYA}复测：$d（原 RTT ${rtt}ms）${OFF}"; SNI_CATEGORY="$category"; SNI_PURPOSE="$purpose"
+    if sni_probe "$d" "$source"; then :; else local rc=$?; if [ "$rc" = 7 ]; then echo '  归属待验证，保留旧记录。'; else echo '  已从活跃候选中移除。'; fi; fi
+  done <"$bak"
+  rm -f "$bak"; sni_sort_active; echo '复测完成：不合格项已移除，归属暂无法核实的旧记录保留；详情见本次归档。'
 }
 sni_scanner_menu() {
   while :; do
@@ -957,7 +1087,7 @@ add_vless() {
   ask_common || { die 'Invalid or duplicate name/port.'; return; }; select_reality_sni || return; local id tls pub sid f
   id=$(uuid); tls=$(reality_tls "$DOMAIN") || return; pub=$(echo "$tls" | jq -r '._public'); sid=$(echo "$tls"|jq -r '.reality.short_id[0]')
   f="$CONF/$NAME.json"; jq -n --arg tag "$NAME" --argjson p "$PORT" --arg id "$id" --argjson tls "$tls" '{inbounds:[{type:"vless",tag:$tag,listen:"::",listen_port:$p,users:[{uuid:$id,flow:"xtls-rprx-vision"}],tls:($tls|del(._public))}]}' >"$f"
-  jq -n --arg name "$NAME" --arg type vless --argjson port "$PORT" --arg uuid "$id" --arg domain "$DOMAIN" --arg pbk "$pub" --arg sid "$sid" '{name:$name,type:$type,port:$port,uuid:$uuid,domain:$domain,pbk:$pbk,sid:$sid}' >"$META/$NAME.meta"; if check_commit "$f"; then show_node "$NAME"; else rm -f "$META/$NAME.meta"; fi
+  jq -n --arg name "$NAME" --arg type vless --argjson port "$PORT" --arg uuid "$id" --arg domain "$DOMAIN" --arg pbk "$pub" --arg sid "$sid" '{name:$name,type:$type,port:$port,uuid:$uuid,domain:$domain,pbk:$pbk,sid:$sid}' >"$META/$NAME.meta"; if check_commit "$f"; then guard_offer "$NAME"; show_node "$NAME"; else rm -f "$META/$NAME.meta"; fi
 }
 require_caddy_domain() {
   echo '  正在读取自有域名配置 …'
@@ -1053,7 +1183,7 @@ add_anytls() {
   ask_common || { die 'Invalid or duplicate name/port.'; return; }; select_reality_sni || return; local pass tls sid f
   pass=$(openssl rand -base64 24 | tr -d '=+/\n' | head -c 24); tls=$(reality_tls "$DOMAIN") || return; sid=$(echo "$tls"|jq -r '.reality.short_id[0]'); f="$CONF/$NAME.json"
   jq -n --arg tag "$NAME" --argjson p "$PORT" --arg pass "$pass" --argjson tls "$tls" '{inbounds:[{type:"anytls",tag:$tag,listen:"::",listen_port:$p,users:[{password:$pass}],padding_scheme:["stop=8","0=30-30","1=100-400","2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000","3=9-9,500-1000","4=500-1000","5=500-1000","6=500-1000","7=500-1000"],tls:($tls|del(._public))}]}' >"$f"
-  jq -n --arg name "$NAME" --arg type anytls --argjson port "$PORT" --arg password "$pass" --arg domain "$DOMAIN" --arg pbk "$(echo "$tls" | jq -r '._public')" --arg sid "$sid" '{name:$name,type:$type,port:$port,password:$password,domain:$domain,pbk:$pbk,sid:$sid}' >"$META/$NAME.meta"; if check_commit "$f"; then show_node "$NAME"; else rm -f "$META/$NAME.meta"; fi
+  jq -n --arg name "$NAME" --arg type anytls --argjson port "$PORT" --arg password "$pass" --arg domain "$DOMAIN" --arg pbk "$(echo "$tls" | jq -r '._public')" --arg sid "$sid" '{name:$name,type:$type,port:$port,password:$password,domain:$domain,pbk:$pbk,sid:$sid}' >"$META/$NAME.meta"; if check_commit "$f"; then guard_offer "$NAME"; show_node "$NAME"; else rm -f "$META/$NAME.meta"; fi
 }
 selfcert() { local n=$1; openssl req -x509 -newkey rsa:2048 -nodes -keyout "$MERURU_HOME/certs/$n.key" -out "$MERURU_HOME/certs/$n.crt" -days 3650 -subj '/CN=meruru' >/dev/null 2>&1; }
 add_hy2() {
@@ -1174,6 +1304,8 @@ show_node() {
   link=$(node_link "$n" "$ip") || return 1
   ui_title '节点详情'
   printf '  名称  %s\n  类型  %s\n' "$(jq -r .name "$m")" "$type"
+  case "$type" in vless|anytls)
+    if jq -e '(.guard_port//0)>0' "$m" >/dev/null; then echo '  回落 SNI 过滤  已开启'; else echo '  回落 SNI 过滤  未开启'; fi;;esac
   ui_section '客户端配置'
   if [ "$type" = hysteria2 ]; then
     hop=$(jq -r '.hop // empty' "$m")
@@ -1301,6 +1433,7 @@ port_busy() { # $1 port, $2 optional node name whose currently bound port is per
     [ -f "$m" ] || continue
     mp=$(jq -r '.port//0' "$m")
     if [ "$m" != "$META/$owner.meta" ] && [ "$mp" = "$p" ]; then return 0; fi
+    mp=$(jq -r '.guard_port//0' "$m"); [ "$mp" != "$p" ] || return 0
     h=$(jq -r '.hop//empty' "$m"); [ -n "$h" ] || continue
     IFS=- read -r first last <<<"$h"
     [[ "$first" =~ ^[0-9]+$ && "$last" =~ ^[0-9]+$ ]] || continue
@@ -1312,24 +1445,83 @@ transaction_begin() {
   TX_NODE=$1; TX_CONF=$(mktemp) && TX_META=$(mktemp) && cp "$CONF/$1.json" "$TX_CONF" && cp "$META/$1.meta" "$TX_META" || { transaction_end; return 1; }
 }
 transaction_end() { rm -f "${TX_CONF:-}" "${TX_META:-}"; unset TX_NODE TX_CONF TX_META; }
+transaction_restore() {
+  cp "$TX_CONF" "$CONF/$TX_NODE.json" && cp "$TX_META" "$META/$TX_NODE.meta" || { die "配置恢复失败，备份仍保留：$TX_CONF 和 $TX_META"; return 1; }
+}
 update_transaction() { # transaction_begin MUST be called before the caller edits either file
-  local n=$1 f="$CONF/$1.json" m="$META/$1.meta" active=0 failed=0 candidate
+  local n=$1 f="$CONF/$1.json" m="$META/$1.meta" active=0 failed=0 candidate rollback_failed=0
   [ "${TX_NODE:-}" = "$n" ] && [ -f "${TX_CONF:-}" ] && [ -f "${TX_META:-}" ] || { die '内部事务备份缺失，拒绝保存。'; return 1; }
-  if ! check_node_pair "$n" || ! "$MERURU_BIN" check -c "$MAIN" -C "$CONF"; then cp "$TX_CONF" "$f"; cp "$TX_META" "$m"; transaction_end; die '校验失败，已恢复原节点。'; return 1; fi
+  if ! check_node_pair "$n" || ! "$MERURU_BIN" check -c "$MAIN" -C "$CONF"; then transaction_restore || return 1; transaction_end; die '校验失败，已恢复原节点。'; return 1; fi
+  if jq -e '(.guard_port//0)>0' "$m" >/dev/null && ! guard_environment_safe; then transaction_restore || return 1; transaction_end; die '路由顺序无法保证，节点未更改。'; return 1; fi
   systemctl is-active --quiet meruru.service && active=1
-  [ "$active" = 0 ] || restart || failed=1
-  network_open "$m" || failed=1
-  if [ "$(jq -r .type "$m")" = vless-ws ]; then caddy_ws_sync || failed=1; fi
+  if [ "$failed" = 0 ] && [ "$active" = 1 ]; then restart || failed=1; fi
+  if [ "$failed" = 0 ] && [ "$active" = 1 ] && jq -e '(.guard_port//0)>0' "$m" >/dev/null; then guard_verify "$m" || failed=1; fi
+  if [ "$failed" = 0 ]; then network_open "$m" || failed=1; fi
+  if [ "$failed" = 0 ] && [ "$(jq -r .type "$m")" = vless-ws ]; then caddy_ws_sync || failed=1; fi
   if [ "$failed" = 0 ]; then network_remove_delta "$TX_META" "$m" || failed=1; fi
   if [ "$failed" = 1 ]; then
-    candidate=$(mktemp); cp "$m" "$candidate"
-    cp "$TX_CONF" "$f"; cp "$TX_META" "$m"
-    network_open "$m"; network_remove_delta "$candidate" "$m"; rm -f "$candidate"
-    [ "$(jq -r .type "$m")" != vless-ws ] || caddy_ws_sync
-    [ "$active" = 0 ] || restart
+    candidate=$(mktemp) && cp "$m" "$candidate" || { die "无法备份失败配置；原始备份：$TX_CONF 和 $TX_META"; return 1; }
+    transaction_restore || { rm -f "$candidate"; return 1; }
+    network_open "$m" || rollback_failed=1
+    network_remove_delta "$candidate" "$m" || rollback_failed=1
+    rm -f "$candidate"
+    [ "$(jq -r .type "$m")" != vless-ws ] || caddy_ws_sync || rollback_failed=1
+    [ "$active" = 0 ] || restart || rollback_failed=1
+    if [ "$rollback_failed" = 1 ]; then die "更新失败，回滚未完全成功；原始备份：$TX_CONF 和 $TX_META，请检查服务日志。"; return 1; fi
     transaction_end; die '更新失败，已恢复节点及相关资源。'; return 1
   fi
   transaction_end; echo -e "${GRN}节点已更新；原先停止的服务保持停止。${OFF}"
+}
+guard_verify() {
+  local m=$1 p domain
+  p=$(jq -r .guard_port "$m"); domain=$(jq -r .domain "$m")
+  echo '  验证受保护的回落 TLS 连接 …'
+  timeout 12 openssl s_client -connect "127.0.0.1:$p" -servername "$domain" -tls1_3 -verify_hostname "$domain" -verify_return_error </dev/null >/dev/null 2>&1 || { die '回落 TLS 验证失败，无法保证节点可用。'; return 1; }
+}
+guard_environment_safe() {
+  local f n count
+  jq -e '(.route.rules // []) == [{"ip_is_private":true,"outbound":"direct"}] and any(.outbounds[]?; .tag=="direct" and .type=="direct")' "$MAIN" >/dev/null || { die '主路由包含自定义规则，不能保证 SNI 过滤顺序。'; return 1; }
+  for f in "$CONF"/*.json; do
+    [ -f "$f" ] || continue
+    count=$(jq -er '.route.rules // [] | length' "$f") || return 1
+    [ "$count" -gt 0 ] || continue
+    n=$(basename "$f" .json)
+    [ -f "$META/$n.meta" ] && jq -e '(.guard_port//0)>0' "$META/$n.meta" >/dev/null && check_node_pair "$n" || { die '发现其他路由规则，不能保证过滤顺序。'; return 1; }
+  done
+}
+guard_toggle() {
+  local n=$1 f="$CONF/$1.json" m="$META/$1.meta" p target domain tag
+  check_node_pair "$n" || { transaction_end; return 1; }
+  if jq -e '(.guard_port//0)>0' "$m" >/dev/null; then
+    target=$(jq -r '.guard_target_port' "$m"); domain=$(jq -r '.domain' "$m")
+    jq --arg d "$domain" --argjson p "$target" '.inbounds[0].tls.reality.handshake.server=$d | .inbounds[0].tls.reality.handshake.server_port=$p | .inbounds |= .[:1] | del(.route)' "$f" >"$f.tmp" && mv "$f.tmp" "$f" &&
+    jq 'del(.guard_port,.guard_target_port)' "$m" >"$m.tmp" && mv "$m.tmp" "$m" || { transaction_restore && transaction_end; die '无法更新防偷配置。'; return 1; }
+  else
+    guard_environment_safe || { transaction_end; return 1; }
+    jq -e '.inbounds|length==1' "$f" >/dev/null && jq -e '.route==null' "$f" >/dev/null || { transaction_end; die '节点包含自定义配置，不自动修改。'; return 1; }
+    systemctl is-active --quiet meruru.service || { transaction_end; die '请先启动节点服务，以便验证防偷回落连接。'; return 1; }
+    p=$(random_free_port) || { transaction_end; die '无法分配本机防偷端口。'; return 1; }
+    target=$(jq -r '.inbounds[0].tls.reality.handshake.server_port // 443' "$f"); port "$target" || { transaction_end; return 1; }
+    domain=$(jq -r .domain "$m"); tag="$n-sni-guard"
+    jq --arg d "$domain" --arg g "$tag" --argjson p "$p" --argjson target "$target" '
+      .inbounds[0].tls.reality.handshake.server="127.0.0.1" |
+      .inbounds[0].tls.reality.handshake.server_port=$p |
+      .inbounds += [{type:"direct",tag:$g,listen:"127.0.0.1",listen_port:$p,network:"tcp",override_address:"192.0.2.1",override_port:1}] |
+      .route.rules=[{inbound:[$g],action:"sniff",sniffer:["tls"],timeout:"3s"},{inbound:[$g],domain:[$d],action:"route",outbound:"direct",override_address:$d,override_port:$target},{inbound:[$g],action:"reject"}]
+    ' "$f" >"$f.tmp" && mv "$f.tmp" "$f" &&
+    jq --argjson p "$p" --argjson target "$target" '.guard_port=$p | .guard_target_port=$target' "$m" >"$m.tmp" && mv "$m.tmp" "$m" || { transaction_restore && transaction_end; die '无法生成防偷配置。'; return 1; }
+  fi
+  update_transaction "$n" || return 1
+  echo '  SNI 过滤无法检查加密后的 HTTP Host，也不阻止使用相同 SNI 的回落流量。'
+}
+guard_offer() {
+  local n=$1 choice
+  [ -t 0 ] || return 0
+  echo '  可启用回落 SNI 过滤；它无法检查加密后的 HTTP Host。'
+  read -r -p '  为新节点开启回落过滤？[y/N] ' choice || return 0
+  [[ "$choice" =~ ^[Yy]$ ]] || return 0
+  transaction_begin "$n" || { die '无法创建备份；节点保持原配置。'; return 1; }
+  guard_toggle "$n" || { echo '  防护未启用；请检查上方恢复状态。'; return 1; }
 }
 change_node() {
   local n type f m old new hop target target_port
@@ -1340,6 +1532,7 @@ change_node() {
   [ "$type" = hysteria2 ] && ui_item 3 '修改 Hy2 跳跃端口范围'
   [ "$type" = direct ] && ui_item 3 '修改一键落地目标'
   case "$type" in vless|anytls) ui_item 3 '修改 SNI（选择后自动复测）';; esac
+  case "$type" in vless|anytls) ui_item 4 'SNI 防偷    开启 / 关闭回落过滤';; esac
   [ "$type" != vless-ws ] || { echo '  此处修改本机后端端口；客户端 TLS 入口始终为 443。'; ui_item 3 '重新生成 WebSocket 路径'; }
   ui_rule; ui_item 0 '返回'; read -r -p '  选择：' x || { transaction_end; return 1; }
   case "$x" in
@@ -1369,10 +1562,11 @@ change_node() {
         update_transaction "$n" && show_node "$n"
       elif [ "$type" = vless ] || [ "$type" = anytls ]; then
         select_reality_sni || { transaction_end; return; }
-        jq --arg s "$DOMAIN" '.inbounds[0].tls.server_name=$s | .inbounds[0].tls.reality.handshake.server=$s' "$f" >"$f.tmp" && mv "$f.tmp" "$f"
+        jq --arg s "$DOMAIN" --argjson guarded "$(jq '(.guard_port//0)>0' "$m")" '.inbounds[0].tls.server_name=$s | if $guarded then .route.rules[1].domain=[$s] | .route.rules[1].override_address=$s else .inbounds[0].tls.reality.handshake.server=$s end' "$f" >"$f.tmp" && mv "$f.tmp" "$f"
         jq --arg s "$DOMAIN" '.domain=$s' "$m" >"$m.tmp" && mv "$m.tmp" "$m"
         update_transaction "$n" && show_node "$n"
       else transaction_end; die '无此选项。'; fi;;
+   4) case "$type" in vless|anytls) guard_toggle "$n";;*) transaction_end; die '此节点不支持该功能。'; return 1;;esac;;
    *) transaction_end; return;; esac
 }
 uninstall_meruru() {
@@ -1995,6 +2189,18 @@ update_binary() {
     if ! systemctl is-active --quiet "$unit"; then
       restore_update_binary "$target" "$unit" || return 1
       die '新版本未保持运行，已恢复旧程序。'; return 1
+    fi
+    if [ "$kind" = core ]; then
+      local m failed=0
+      for m in "$META"/*.meta; do
+        [ -f "$m" ] || continue
+        jq -e '(.guard_port//0)>0' "$m" >/dev/null 2>&1 || continue
+        guard_environment_safe && guard_verify "$m" || { failed=1; break; }
+      done
+      if [ "$failed" = 1 ]; then
+        restore_update_binary "$target" "$unit" || return 1
+        die '新内核的 SNI 回落验证失败，已恢复旧内核。'; return 1
+      fi
     fi
   fi
   echo '  程序更新完成；原先停止的服务保持停止，节点数据未改动。'

@@ -14,7 +14,7 @@ CADDY_BIN="$MERURU_HOME/bin/caddy"
 CADDY_DIR="$MERURU_HOME/caddy"
 CADDY_SERVICE=/etc/systemd/system/meruru-caddy.service
 COMMAND_DIR=/usr/local/bin
-MERURU_VERSION=1.0.4
+MERURU_VERSION=1.0.5
 UPDATE_URL=https://raw.githubusercontent.com/shinkumiyo/itsmeruru/main/meruru
 LEGACY_HOME=/etc/sbx
 LEGACY_SERVICE=/etc/systemd/system/sbx.service
@@ -404,7 +404,6 @@ test_sni() { # Three TCP samples (median) gate first, then strict TLS/HTTP scree
   local d=$1 official_pool=${2:-} hdr tls cert ms sample start_ns end_ns ip tls13 h2 x25519 san; local -a samples=()
   SNI_LAST_RTT=; SNI_LAST_IP=; [[ "$d" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
   ip=$(getent ahostsv4 "$d" 2>/dev/null | awk 'NR==1{print $1}'); [ -n "$ip" ] || { echo '  DNS 解析失败'; return 1; }
-  if [ -n "${SNI_EXPECT_IP:-}" ] && [ "$ip" != "$SNI_EXPECT_IP" ]; then echo '  域名解析地址与探测地址不同，跳过'; return 1; fi
   hdr=$(mktemp); tls=$(mktemp); cert=$(mktemp)
   # Three fast TCP handshakes give a stable median while still rejecting slow sites before costly TLS work.
   for sample in 1 2 3; do
@@ -921,70 +920,6 @@ sni_revalidate() { # Build a fresh database: failures disappear, successes retai
   while IFS=$'\t' read -r d category source purpose ip rtt verified; do echo -e "${CYA}复测：$d（原 RTT ${rtt}ms）${OFF}"; SNI_CATEGORY="$category"; SNI_PURPOSE="$purpose"; sni_probe "$d" "$source" || echo '  已从活跃候选中移除。'; done <"$bak"
   rm -f "$bak"; sni_sort_active; echo '复测完成：不合格项已从活跃候选库移除，详情已写入本次归档。'
 }
-sni_host_reachable() { timeout 1 bash -c 'exec 3<>"/dev/tcp/$1/443"' _ "$1" 2>/dev/null; }
-sni_network_notice() {
-  local cidr confirm addr prefix a b c d number mask base total host ip cert names domain count=0 passed=0 tested=0 existing choice endpoint max_hosts
-  local SNI_EXPECT_IP= SNI_SCAN_SCOPE= SNI_CATEGORY=冷门可信 SNI_PURPOSE= SNI_ARCHIVE=
-  ui_title '偷邻居 · 实验性功能'
-  echo -e "${YEL}  仅供测试：本功能会主动连接同网段的其他 IP。${OFF}"
-  echo '  只探测选定网段的 TCP 443；从默认 TLS 证书和 PTR 提取域名。'
-  echo '  逐个地址显示进度；无响应的 443 端口最多等待约 1 秒。'
-  echo '  可能后果：触发网络扫描告警、收到滥用投诉、网络限制或服务暂停。'
-  echo '  低频和数量限制不能保证避免告警；同网段不等于你有权探测。'
-  echo '  仅可探测你拥有或明确获授权的地址，并须确认 VPS 服务商允许。'
-  addr=
-  for endpoint in https://api.ipify.org https://icanhazip.com; do
-    addr=$(curl -4fsS --connect-timeout 2 --max-time 4 "$endpoint" 2>/dev/null | tr -d '[:space:]')
-    [[ "$addr" =~ ^[0-9.]+$ ]] && public_address_valid "$addr" && break
-    addr=
-  done
-  [ -n "$addr" ] || { die '无法自动获取本机公网 IPv4，已取消探测。'; return 1; }
-  [[ "$addr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
-  a=$((10#${BASH_REMATCH[1]})); b=$((10#${BASH_REMATCH[2]})); c=$((10#${BASH_REMATCH[3]})); d=$((10#${BASH_REMATCH[4]}))
-  echo "  本机公网 IPv4：$addr"
-  ui_item 1 '轻量    最多 16 个地址（默认）'
-  ui_item 2 '适中    最多 32 个地址'
-  ui_item 3 '扩展    最多 64 个地址'
-  read -r -p '  探测数量 [1]（0 取消）：' choice || return 1
-  case "${choice:-1}" in 1)max_hosts=16;;2)max_hosts=32;;3)max_hosts=64;;0)return 0;;*)die '数量编号无效。'; return 1;;esac
-  prefix=24
-  number=$(( (a<<24) | (b<<16) | (c<<8) | d )); total=$((1 << (32-prefix))); mask=$((total-1)); base=$((number & ~mask))
-  cidr="$((base>>24 & 255)).$((base>>16 & 255)).$((base>>8 & 255)).$((base & 255))/$prefix"
-  echo "  范围：$cidr；最多探测 $max_hosts 个主机，单线程，每个地址最多验证 4 个域名。"
-  echo '  每个地址结束后等待 1 秒；发现域名后还会进行多次连接以验证。'
-  echo '  域名需解析到正在探测的地址，并通过现有 RTT、TLS、CDN 和屏蔽名单筛选。'
-  read -r -p '  已了解后果，并确认已获授权且服务商允许？[y/N] ' confirm || return 1
-  [[ "$confirm" =~ ^[Yy]$ ]] || { echo '  已取消。'; return 0; }
-  sni_archive_begin authorized-cidr || return 1; SNI_SCAN_SCOPE="cidr/$cidr"
-  cert=$(mktemp) || return 1; names=$(mktemp) || { rm -f "$cert"; return 1; }
-  for ((host=1;host<total-1;host++)); do
-    number=$((base+host)); ip="$((number>>24 & 255)).$((number>>16 & 255)).$((number>>8 & 255)).$((number & 255))"
-    [ "$ip" != "$addr" ] || continue
-    count=$((count+1))
-    echo "  [$count/$max_hosts] 探测 $ip:443 · 合格 $passed/3"
-    if ! sni_host_reachable "$ip"; then [ "$count" -lt "$max_hosts" ] || break; sleep 1; continue; fi
-    : >"$names"
-    timeout 2 openssl s_client -connect "$ip:443" -noservername -showcerts -tls1_3 </dev/null >"$cert" 2>/dev/null || true
-    openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null | grep -Eo 'DNS:[A-Za-z0-9.-]+' | cut -c5- >>"$names" || true
-    timeout 3 dig +time=1 +tries=1 +short -x "$ip" 2>/dev/null | sed 's/\.$//' >>"$names" || true
-    local per_ip=0
-    while IFS= read -r domain; do
-      domain=${domain,,}; [[ "$domain" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}$ ]] || continue
-      existing="$MERURU_HOME/sni-candidates.tsv"
-      [ ! -s "$existing" ] || ! awk -F'\t' -v d="$domain" '$1==d{found=1} END{exit !found}' "$existing" || continue
-      per_ip=$((per_ip+1)); tested=$((tested+1)); SNI_EXPECT_IP=$ip
-      SNI_PURPOSE="授权网段 $cidr 的证书或 PTR 发现；站点用途需自行核实"
-      echo "  [$tested] $domain · $ip"
-      if sni_probe "$domain" authorized-cidr; then passed=$((passed+1)); fi
-      [ "$passed" -lt 3 ] && [ "$per_ip" -lt 4 ] || break
-    done < <(sort -fu "$names")
-    [ "$passed" -lt 3 ] && [ "$count" -lt "$max_hosts" ] || break
-    sleep 1
-  done
-  rm -f "$cert" "$names"; sni_sort_active
-  echo "  完成：探测 $count 个地址，验证 $tested 个域名，新增 $passed / 3 个候选。"
-  echo "  扫描归档：$SNI_ARCHIVE"
-}
 sni_scanner_menu() {
   while :; do
     clear
@@ -1005,7 +940,6 @@ sni_scanner_menu() {
     ui_section '设置与记录'
     ui_item 7 '探测设置    RTT 阈值（自动保存）'
     ui_item 8 '清理归档    单个 / 全部'
-    ui_item 9 '偷邻居      实验性 · 仅供测试 / 授权网段'
     ui_rule
     ui_item 0 '返回主菜单'
     echo
@@ -1014,7 +948,7 @@ sni_scanner_menu() {
       1)sni_institution_discovery;;2)sni_hot_discovery;;3)sni_import;;4)sni_view;;5)sni_revalidate;;6)sni_candidate_manage;;
       7) read -r -p "RTT 阈值（5–200ms，当前 ${SNI_MAX_RTT_MS}）：" y || return 0
          if [[ "$y" =~ ^[0-9]+$ ]] && [ "$y" -ge 5 ] && [ "$y" -le 200 ]; then SNI_MAX_RTT_MS=$y; printf '%s\n' "$y" >"$MERURU_HOME/rtt-limit"; else die '阈值无效。'; fi;;
-      8)sni_archive_manage;;9)sni_network_notice;;0)return;;
+      8)sni_archive_manage;;0)return;;
     esac
     pause
   done

@@ -14,7 +14,7 @@ CADDY_BIN="$MERURU_HOME/bin/caddy"
 CADDY_DIR="$MERURU_HOME/caddy"
 CADDY_SERVICE=/etc/systemd/system/meruru-caddy.service
 COMMAND_DIR=/usr/local/bin
-MERURU_VERSION=1.0.10
+MERURU_VERSION=1.0.11
 UPDATE_URL=https://raw.githubusercontent.com/shinkumiyo/itsmeruru/main/meruru
 LEGACY_HOME=/etc/sbx
 LEGACY_SERVICE=/etc/systemd/system/sbx.service
@@ -493,21 +493,25 @@ sni_record_candidate() { # domain, category, source, human-readable purpose; rep
   sni_sort_active
 }
 sni_cn_reachability() { # 0: absent from the maintained mainland-China block list; 1: listed; 2: list unavailable
-  local d=$1 candidate cache="$MERURU_HOME/cn-blocked-domains.txt" tmp
-  # google.com and its subdomains are widely subject to SNI filtering in China.
-  # Do not rely solely on an external list to exclude these exact suffixes.
-  case "${d,,}" in google.com|*.google.com) return 1;; esac
+  local d=${1,,} candidate cache="$MERURU_HOME/cn-blocked-domains.txt" tmp
+  d=${d%.}
+  [[ "$d" =~ ^[a-z0-9][a-z0-9.-]*[a-z0-9]$ && "$d" == *.* && "$d" != *..* ]] || return 1
+  # Known/reported SNI filtering: conservatively exclude these suffixes.
+  case "$d" in google.com|*.google.com|apple.com|*.apple.com) return 1;; esac
   mkdir -p "$MERURU_HOME"
-  if [ ! -s "$cache" ] || [ "$(find "$cache" -mtime +7 -print 2>/dev/null)" ]; then
+  if ! sni_cn_list_valid "$cache" || [ "$(find "$cache" -mtime +7 -print 2>/dev/null)" ]; then
     tmp=$(mktemp)
-    curl -fsSL --connect-timeout 8 --max-time 35 'https://github.com/Loyalsoldier/cn-blocked-domain/raw/release/domains.txt' -o "$tmp" 2>/dev/null && grep -Eq '^[A-Za-z0-9.-]+$' "$tmp" && mv "$tmp" "$cache" || { rm -f "$tmp"; return 2; }
+    curl -fsSL --connect-timeout 8 --max-time 35 --max-filesize 10000000 'https://github.com/Loyalsoldier/cn-blocked-domain/raw/release/domains.txt' -o "$tmp" 2>/dev/null && sni_cn_list_valid "$tmp" && mv "$tmp" "$cache" || { rm -f "$tmp"; return 2; }
   fi
   candidate=$d
   while :; do
-    grep -Fxi "$candidate" "$cache" >/dev/null && return 1
+    grep -Fxi -- "$candidate" "$cache" >/dev/null && return 1
     [[ "$candidate" = *.* ]] || break; candidate=${candidate#*.}
   done
   return 0
+}
+sni_cn_list_valid() { # Reject truncated or error responses; no claim that a list proves reachability.
+  [ -s "$1" ] && awk 'BEGIN{n=0} /^[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z][A-Za-z0-9-]*\r?$/ {n++} END {exit !(n>=1000)}' "$1"
 }
 sni_history_record() { # Latest result + cumulative counts, bound to the probing server's location.
   local d=$1 source=$2 rc=$3 detail=$4 db="$MERURU_HOME/sni-history.json" tmp reason ttl now
@@ -663,7 +667,7 @@ sni_recommended_rows() { # Sorted view only: keep the on-disk candidate schema u
   rm -f "$hist"
 }
 select_candidate_sni() { # $1 category
-  local wanted=$1 db="$MERURU_HOME/sni-candidates.tsv" line d choice=0 selected category source purpose ip rtt verified; local -a domains=()
+  local wanted=$1 db="$MERURU_HOME/sni-candidates.tsv" line d choice=0 selected category source purpose ip rtt verified cn_rc; local -a domains=()
   sni_normalize_db; [ -s "$db" ] || return 1; sni_sort_active
   while IFS=$'\t' read -r d category source purpose ip rtt verified; do
     if [ "$wanted" = custom ]; then [ "$source" = import ] || continue
@@ -671,8 +675,10 @@ select_candidate_sni() { # $1 category
     if [ "$wanted" = 热门可信 ]; then
       case "$source" in popular-owned|popular-verified) :;; *) continue;; esac
     fi
-    case "${d,,}" in google.com|*.google.com) continue;; esac
     [[ "$rtt" =~ ^[0-9]+([.][0-9]+)?$ ]] || continue
+    cn_rc=0; sni_cn_reachability "$d" || cn_rc=$?
+    [ "$cn_rc" != 1 ] || continue
+    [ "$cn_rc" != 2 ] || { die '大陆屏蔽名单不可用，保留原候选；无法安全筛选，请稍后重试。'; return 2; }
     domains+=("$d")
     ui_item "${#domains[@]}" "$d  · RTT ${rtt}ms"
     printf '      %s（%s，%s）\n' "$purpose" "$source" "$ip"
@@ -686,10 +692,10 @@ select_candidate_sni() { # $1 category
   IFS=$'\t' read -r d SNI_CATEGORY source SNI_PURPOSE ip rtt verified <<<"$selected"
   echo "建节点前复测：$DOMAIN"
   sni_archive_begin selected-retest || { die '无法创建复测归档，未修改候选。'; return 2; }
-  if SNI_REMOVE_FAILED=1 sni_probe "$DOMAIN" "$source"; then :; else
+  if sni_probe "$DOMAIN" "$source"; then :; else
     local rc=$?
     if [ "$rc" = 6 ] || [ "$rc" = 7 ] || [ "$rc" = 8 ] || [ "$rc" = 9 ]; then die '筛查或保存暂不可用；保留旧记录，本次不能使用。'; return 2; fi
-    sni_sort_active; die '复测未通过，已移除该候选，请重新选择。'; return 2
+    die '复测未通过，已保留候选记录；请重新选择或手动复测清理。'; return 2
   fi
   sni_sort_active
   return 0
@@ -707,7 +713,7 @@ select_reality_sni() {
   local geo choice own_domain
   ui_title '选择 SNI'
   geo=$(curl -fsS --max-time 4 https://ipapi.co/country_name/ 2>/dev/null || true)
-  echo "服务器位置：${geo:-未知}。候选的实际质量以本机探测结果为准。"
+  echo "服务器位置：${geo:-未知}。筛查未实测国内网络，建节点后需从国内测试该节点。"
   ui_section '候选库 · 冷门按 RTT / 热门兼顾历史稳定性，选中后复测'
   ui_item 1 '冷门可信    当地机构与站点'
   ui_item 2 '热门可信    品牌多入口 / 延迟与稳定性推荐'
@@ -729,7 +735,9 @@ select_reality_sni() {
        [ -n "$own_domain" ] || return 1
        DOMAIN=$own_domain
        test_sni "$DOMAIN" official || { die '自有域名尚未通过 HTTPS 检测；请运行 journalctl -u meruru-caddy.service -n 80 --no-pager 查看证书日志，签发完成后重试。'; return 1; };;
-    5) read -r -p 'SNI 域名：' DOMAIN; test_sni "$DOMAIN" || { die '测试未通过，已取消创建。'; return 1; };;
+    5) read -r -p 'SNI 域名：' DOMAIN
+       sni_cn_reachability "$DOMAIN" || { die '该域名命中屏蔽名单或名单不可用，已取消创建。'; return 1; }
+       test_sni "$DOMAIN" || { die '测试未通过，已取消创建。'; return 1; };;
     *) return 1;; esac
   echo "已选择 SNI：$DOMAIN"
 }
@@ -871,15 +879,17 @@ sni_hot_expand_official() { # Only exact approved vendor suffixes; no random ran
   done
 }
 sni_hot_discovery() { # Brand suffix plus official provider IP-range evidence required.
-  local item host purpose category source ip rtt verified confirm tested=0 passed=0 total pool cached=0 unsupported=0
+  local item host purpose category source ip rtt verified confirm tested=0 passed=0 total pool cached=0 unsupported=0 passed_file
   echo -e "${YEL}热门可信候选：检测知名企业的官方入口，不使用随机排名站点或来源不明域名。${OFF}"
   echo '须通过中国大陆屏蔽名单、TLS、H2、X25519、第三方 CDN 与 RTT 筛查。'
   echo '推荐综合三次握手中位数、历史通过/失败次数和延迟波动；新域名标记为样本不足。'
   echo '仅接受 Apple、Google 和 Microsoft 中可匹配官方网络范围的入口；其他品牌暂不作归属保证。'
   echo '官方 IP 范围是归属证据，并不能证明完全不存在共享 CDN 或域名前置。'
+  echo '屏蔽名单不等于国内实测；建节点后请在实际国内网络测试连接。'
   read -r -p '确认开始扫描？[Y/n] ' confirm || return 1; [[ -z "$confirm" || "$confirm" =~ ^[Yy]$ ]] || return; sni_archive_begin popular-owned || return 1
   SNI_SCAN_SCOPE="popular/$(public_ip)"
   pool=$(mktemp)
+  passed_file=$(mktemp) || { rm -f "$pool"; return 1; }
   cat >"$pool" <<'EOF'
 www.microsoft.com	Microsoft 官方网站
 www.office.com	Microsoft 365 官方入口
@@ -991,16 +1001,17 @@ EOF
     fi
     tested=$((tested+1)); echo -e "\n${CYA}[$tested / $total] $host · $purpose${OFF}"
     SNI_CATEGORY=热门可信; SNI_PURPOSE="$purpose"
-    sni_probe "$host" popular-owned && passed=$((passed+1))
+    if sni_probe "$host" popular-owned; then passed=$((passed+1)); printf '%s\n' "$host" >>"$passed_file"; fi
   done <"$pool"
   rm -f "$pool"; unset SNI_SCAN_SCOPE
   sni_sort_active
   echo -e "${GRN}完成：实测 $tested，合格 $passed，缓存跳过 $cached。以下按延迟与历史稳定性推荐：${OFF}"
   while IFS=$'\t' read -r host category source purpose ip rtt verified; do
     [ "$category" = 热门可信 ] && [ "$source" = popular-verified ] || continue
-    sni_cn_reachability "$host" || continue
+    grep -Fqx "$host" "$passed_file" || continue
     printf '  %s · %sms · %s\n' "$host" "$rtt" "$purpose"; sni_history_summary "$host"
   done < <(sni_recommended_rows)
+  rm -f "$passed_file"
 }
 sni_import() {
   local raw host tested=0 passed=0 category; local -a domains=()
@@ -1033,7 +1044,7 @@ sni_sort_active() { # Only measured records are active and eligible for node cre
 }
 sni_view() {
   local db="$MERURU_HOME/sni-candidates.tsv" measured=0 pending=0 group d category source purpose ip rtt verified
-  echo -e "${CYA}可用候选（冷门按 RTT；热门综合延迟与历史稳定性）:${OFF}"
+  echo -e "${CYA}已保存候选（国内可达性未实测；选择时重新筛查）:${OFF}"
   if [ -s "$db" ]; then
     sni_sort_active
     for group in 冷门可信 热门可信 自定义导入; do
@@ -1043,7 +1054,7 @@ sni_view() {
       else [ "$source" != import ] && [ "$category" = "$group" ] || continue; fi
       if [[ "$rtt" =~ ^[0-9]+([.][0-9]+)?$ ]] && [[ "$ip" =~ ^[0-9.]+$ ]]; then
         measured=$((measured+1)); printf '  %s  [%s]  RTT: %sms\n    用途：%s\n    来源：%s  IP：%s  复测：%s\n' "$d" "$category" "$rtt" "$purpose" "$source" "$ip" "$verified"
-        case "${d,,}" in google.com|*.google.com) echo '    已知中国大陆 SNI 屏蔽：不会推荐或用于候选建节点；可复测清理。';; esac
+        case "${d,,}" in google.com|*.google.com|apple.com|*.apple.com) echo '    中国大陆 SNI 屏蔽风险：不会推荐或用于候选建节点；可复测清理。';; esac
         [ "$source" != popular-owned ] || echo '    旧热门记录，尚未验证官方网络归属。'
         if [ "$category" = 热门可信 ] && [ "$source" != import ] && [ "$source" != popular-owned ] && [ "$source" != popular-verified ]; then
           echo '    旧来源未核验官方网络归属，不会出现在热门节点选择中。'
@@ -1109,6 +1120,7 @@ sni_scanner_menu() {
     ui_title 'SNI 工作台'
     echo "  TCP RTT 阈值：≤ ${SNI_MAX_RTT_MS} ms"
     echo '  技术检测：TLS1.3 · H2 · X25519 · SAN · RTT；屏蔽名单仅辅助筛选'
+    echo '  国内可达性未实测：请在实际国内网络测试建好的节点。'
     echo
     ui_section '发现与导入'
     ui_item 1 '冷门搜索    本地优先 / 可信多源 / 历史复测'

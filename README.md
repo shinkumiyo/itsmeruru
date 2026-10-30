@@ -33,6 +33,8 @@ wget -O /root/meruru https://raw.githubusercontent.com/shinkumiyo/itsmeruru/main
 - 更新内核前检查节点配置兼容性；启动失败会尝试恢复旧程序。停止的服务不会因更新而自动启动。
 - 主菜单 **14 → 运行管理**：管理节点服务和 Caddy，查看状态与日志。
 - 配置目录：`/etc/meruru`；服务名：`meruru.service`、`meruru-caddy.service`。
+- 配置损坏时进入恢复模式，可查看日志、隔离节点配置；`meruru-rollback` 可独立回退上一版管理脚本。
+- 管理操作使用单会话锁，避免多个 SSH 面板同时修改节点；RTT 阈值会自动保存。
 
 ## 使用提示
 
@@ -40,4 +42,5 @@ wget -O /root/meruru https://raw.githubusercontent.com/shinkumiyo/itsmeruru/main
 - Trojan TLS 和 VLESS WS + TLS 需要自己的域名；Caddy 负责自动证书和 HTTPS 站点。
 - SNI 筛查不保证所有国内网络可达，也不保证完全识别第三方 CDN。
 - 节点配置包含密码和密钥，请妥善备份，不要公开上传。
+- 防火墙自动清理仅针对新版记录的自有规则；旧版无归属记录的规则会保守保留，需自行检查整理。
 - sing-box 与 Caddy 从各自官方 GitHub Releases 下载；本项目不是二者的官方项目。

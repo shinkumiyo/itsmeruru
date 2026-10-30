@@ -14,7 +14,7 @@ CADDY_BIN="$MERURU_HOME/bin/caddy"
 CADDY_DIR="$MERURU_HOME/caddy"
 CADDY_SERVICE=/etc/systemd/system/meruru-caddy.service
 COMMAND_DIR=/usr/local/bin
-MERURU_VERSION=2026.10.30.3
+MERURU_VERSION=2026.10.30.4
 UPDATE_URL=https://raw.githubusercontent.com/shinkumiyo/itsmeruru/main/meruru
 LEGACY_HOME=/etc/sbx
 LEGACY_SERVICE=/etc/systemd/system/sbx.service
@@ -36,12 +36,58 @@ safe_name() { [[ "$1" =~ ^[A-Za-z0-9_-]{1,48}$ ]]; }
 json() { jq -cn "$@"; }
 uuid() { [ -r /proc/sys/kernel/random/uuid ] && cat /proc/sys/kernel/random/uuid || openssl rand -hex 16 | sed 's/^/00000000-0000-4000-8000-/'; }
 port() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
-public_ip() { local ip; ip=$(curl -4fsS --max-time 5 https://api.ipify.org 2>/dev/null || true); [ -n "$ip" ] || ip=$(hostname -I | awk '{for(i=1;i<=NF;i++) if($i !~ /:/){print $i;exit}}'); [ -n "$ip" ] || ip=$(curl -6fsS --max-time 5 https://api64.ipify.org 2>/dev/null || hostname -I | awk '{for(i=1;i<=NF;i++) if($i ~ /:/){print $i;exit}}'); [[ "$ip" = *:* ]] && printf '[%s]' "$ip" || printf '%s' "$ip"; }
-restart() { systemctl daemon-reload; systemctl restart meruru.service; }
+public_address_valid() {
+  local ip=${1#[}; ip=${ip%]}
+  if [[ "$ip" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+    local a=$((10#${BASH_REMATCH[1]})) b=$((10#${BASH_REMATCH[2]})) c=$((10#${BASH_REMATCH[3]})) d=$((10#${BASH_REMATCH[4]}))
+    [ "$a" -ge 1 ] && [ "$a" -lt 224 ] && [ "$b" -le 255 ] && [ "$c" -le 255 ] && [ "$d" -le 255 ] || return 1
+    case "$a.$b" in 10.*|127.*|169.254|192.168) return 1;;esac
+    [ "$a" != 172 ] || [ "$b" -lt 16 ] || [ "$b" -gt 31 ] || return 1
+    [ "$a" != 100 ] || [ "$b" -lt 64 ] || [ "$b" -gt 127 ] || return 1
+    return 0
+  fi
+  [[ "$ip" =~ ^[0-9A-Fa-f:]+$ && "$ip" = *:* ]] || return 1
+  local piece count=0 expanded=$ip; local -a pieces=()
+  [[ "$ip" != *:::* ]] || return 1
+  if [[ "$ip" = *::* ]]; then expanded=${ip/::/:}; [[ "$expanded" != *::* ]] || return 1; fi
+  IFS=: read -r -a pieces <<<"$expanded"
+  for piece in "${pieces[@]}"; do [ -n "$piece" ] || continue; [[ "$piece" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1; count=$((count+1)); done
+  if [[ "$ip" = *::* ]]; then [ "$count" -lt 8 ] || return 1; else [ "$count" = 8 ] || return 1; fi
+  case "${ip,,}" in ::|::1|fc*|fd*|fe8*|fe9*|fea*|feb*|ff*)return 1;;esac
+}
+public_ip() {
+  local ip
+  for endpoint in https://api.ipify.org https://icanhazip.com; do
+    ip=$(curl -4fsS --connect-timeout 2 --max-time 4 "$endpoint" 2>/dev/null | tr -d '[:space:]')
+    if public_address_valid "$ip"; then printf '%s' "$ip"; return 0; fi
+  done
+  ip=$(curl -6fsS --connect-timeout 2 --max-time 4 https://api64.ipify.org 2>/dev/null | tr -d '[:space:]')
+  if public_address_valid "$ip"; then printf '[%s]' "$ip"; return 0; fi
+  [ -t 0 ] || { die '无法获取公网地址，请检查网络或手动配置节点服务器地址。'; return 1; }
+  read -r -p '无法识别公网地址，请输入服务器公网 IP：' ip
+  public_address_valid "$ip" || { die '不是有效的公网地址。'; return 1; }
+  ip=${ip#[}; ip=${ip%]}
+  [[ "$ip" != *:* ]] && printf '%s' "$ip" || printf '[%s]' "$ip"
+}
+restart() {
+  timeout 10 systemctl daemon-reload && timeout 25 systemctl restart meruru.service || return 1
+  sleep 1
+  timeout 5 systemctl is-active --quiet meruru.service || { journalctl -u meruru.service -n 25 --no-pager; return 1; }
+}
+secure_state() {
+  chmod 700 "$MERURU_HOME" "$CONF" "$META" "$MERURU_HOME/certs" "$MERURU_HOME/bin" || return 1
+  find "$CONF" "$META" "$MERURU_HOME/certs" -type f -exec chmod 600 {} +
+  [ ! -f "$MAIN" ] || chmod 600 "$MAIN"
+}
+manager_lock() {
+  mkdir -p /run/meruru && chmod 700 /run/meruru || return 1
+  exec 9>/run/meruru/manager.lock
+  flock -n 9 || { die '另一个管理会话正在运行，请先退出该会话。'; return 1; }
+}
 
 pkg_install() {
   local cmd manager pkg ca_missing=0; local -a missing=() pkgs=()
-  for cmd in curl jq openssl tar gzip unzip iptables ip6tables qrencode ss dig getent hostname timeout mktemp sort shuf date install readlink sha256sum awk sed grep find; do
+  for cmd in curl jq openssl tar gzip unzip iptables ip6tables qrencode ss dig getent hostname timeout mktemp sort shuf date install readlink sha256sum awk sed grep find flock; do
     command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
   done
   [ -s /etc/ssl/certs/ca-certificates.crt ] || [ -s /etc/pki/tls/certs/ca-bundle.crt ] || [ -s /etc/ssl/cert.pem ] || ca_missing=1
@@ -59,6 +105,7 @@ pkg_install() {
       ss) [ "$manager" = apt ] && pkg=iproute2 || pkg=iproute;;
       dig) [ "$manager" = apt ] && pkg=dnsutils || pkg=bind-utils;;
       getent) [ "$manager" = apt ] && pkg=libc-bin || pkg=glibc-common;;
+      flock) pkg=util-linux;;
       timeout|mktemp|sort|shuf|date|install|readlink|sha256sum) pkg=coreutils;;
       awk) pkg=gawk;;find) pkg=findutils;;*) pkg=$cmd;;
     esac
@@ -79,12 +126,12 @@ download_core() {
   local arch asset url tmp ver
   case "$(uname -m)" in x86_64|amd64) arch=amd64;; aarch64|arm64) arch=arm64;; *) die "Unsupported architecture: $(uname -m)"; return;; esac
   echo 'Fetching latest stable sing-box release from GitHub...'
-  url=$(curl -fsSL --retry 3 --connect-timeout 10 https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r --arg a "linux-$arch.tar.gz" '.assets[] | select(.name | endswith($a)) | .browser_download_url' | head -n1)
+  url=$(curl -fsSL --retry 3 --connect-timeout 10 --max-time 30 https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r --arg a "linux-$arch.tar.gz" '.assets[] | select(.name | endswith($a)) | .browser_download_url' | head -n1)
   [ -n "$url" ] && [ "$url" != null ] || { die 'Could not find the Linux release asset.'; return; }
   ver=$(basename "$url" | sed -E 's/^sing-box-([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
   [ "$(printf '%s\n' 1.12.0 "$ver" | sort -V | head -n1)" = 1.12.0 ] || { die "Latest release $ver is older than 1.12.0."; return; }
   tmp=$(mktemp -d); trap 'rm -rf "$tmp"' RETURN
-  curl -fL --retry 3 --connect-timeout 15 "$url" -o "$tmp/core.tar.gz" || return
+  curl -fL --retry 3 --connect-timeout 15 --max-time 180 --speed-time 20 --speed-limit 1024 "$url" -o "$tmp/core.tar.gz" || return
   tar -xzf "$tmp/core.tar.gz" -C "$tmp" || return
   install -D -m 755 "$(find "$tmp" -type f -name sing-box | head -n1)" "$MERURU_BIN" || return
   "$MERURU_BIN" version || { rm -f "$MERURU_BIN"; die 'Downloaded core cannot run.'; return; }
@@ -95,28 +142,21 @@ download_caddy() { # Independent Caddy binary: no third-party installer or syste
   local arch url tmp
   case "$(uname -m)" in x86_64|amd64) arch=amd64;; aarch64|arm64) arch=arm64;; *) die "Caddy unsupported architecture: $(uname -m)"; return 1;; esac
   echo 'Fetching latest stable Caddy release from GitHub...'
-  url=$(curl -fsSL --retry 3 --connect-timeout 10 https://api.github.com/repos/caddyserver/caddy/releases/latest | jq -r --arg a "linux_$arch.tar.gz" '.assets[] | select(.name | endswith($a)) | .browser_download_url' | head -n1)
+  url=$(curl -fsSL --retry 3 --connect-timeout 10 --max-time 30 https://api.github.com/repos/caddyserver/caddy/releases/latest | jq -r --arg a "linux_$arch.tar.gz" '.assets[] | select(.name | endswith($a)) | .browser_download_url' | head -n1)
   [ -n "$url" ] && [ "$url" != null ] || { die 'Could not find a Caddy Linux release asset.'; return 1; }
-  tmp=$(mktemp -d); curl -fL --retry 3 --connect-timeout 15 "$url" -o "$tmp/caddy.tar.gz" || { rm -rf "$tmp"; return 1; }
+  tmp=$(mktemp -d); curl -fL --retry 3 --connect-timeout 15 --max-time 180 --speed-time 20 --speed-limit 1024 "$url" -o "$tmp/caddy.tar.gz" || { rm -rf "$tmp"; return 1; }
   tar -xzf "$tmp/caddy.tar.gz" -C "$tmp" || { rm -rf "$tmp"; return 1; }
   install -D -m 755 "$(find "$tmp" -type f -name caddy | head -n1)" "$CADDY_BIN" || { rm -rf "$tmp"; return 1; }
   "$CADDY_BIN" version || { rm -f "$CADDY_BIN"; rm -rf "$tmp"; die 'Downloaded Caddy cannot run.'; return 1; }
   rm -rf "$tmp"
 }
 
-write_base() {
-  mkdir -p "$CONF" "$META" "$MERURU_HOME/bin" "$MERURU_HOME/certs"
-  [ -f "$MAIN" ] || cat >"$MAIN" <<'EOF'
-{
-  "log":{"level":"warn","timestamp":true},
-  "outbounds":[{"type":"direct","tag":"direct"}],
-  "route":{"auto_detect_interface":true,"rules":[{"ip_is_private":true,"outbound":"direct"}],"final":"direct"}
-}
-EOF
+write_hop_script() {
   cat >"$HOP" <<'EOF'
 #!/usr/bin/env bash
 # Generated rules are intentionally reconstructed from metadata on each service start.
 set +e
+failed=0
 for m in /etc/meruru/meta/*.meta; do
   [ -f "$m" ] || continue
   [ "$(jq -r '.type' "$m" 2>/dev/null)" = hysteria2 ] || continue
@@ -127,11 +167,28 @@ $range
 EOF2
   for tool in iptables ip6tables; do
     command -v "$tool" >/dev/null || continue
-    "$tool" -t nat -C PREROUTING -p udp --dport "$first:$last" -j REDIRECT --to-ports "$target" 2>/dev/null || "$tool" -t nat -A PREROUTING -p udp --dport "$first:$last" -j REDIRECT --to-ports "$target" 2>/dev/null
+    if ! "$tool" -w 5 -t nat -C PREROUTING -p udp --dport "$first:$last" -j REDIRECT --to-ports "$target" 2>/dev/null; then
+      if ! "$tool" -w 5 -t nat -A PREROUTING -p udp --dport "$first:$last" -j REDIRECT --to-ports "$target"; then
+        echo "meruru: $tool 无法设置跳跃规则 $first-$last -> $target" >&2
+        [ "$tool" != iptables ] || failed=1
+      fi
+    fi
   done
 done
+exit "$failed"
 EOF
   chmod 700 "$HOP"
+}
+write_base() {
+  mkdir -p "$CONF" "$META" "$MERURU_HOME/bin" "$MERURU_HOME/certs"
+  [ -f "$MAIN" ] || cat >"$MAIN" <<'EOF'
+{
+  "log":{"level":"warn","timestamp":true},
+  "outbounds":[{"type":"direct","tag":"direct"}],
+  "route":{"auto_detect_interface":true,"rules":[{"ip_is_private":true,"outbound":"direct"}],"final":"direct"}
+}
+EOF
+  write_hop_script || return 1
   cat >"$SERVICE" <<EOF
 [Unit]
 Description=MERURU standalone sing-box
@@ -151,24 +208,73 @@ EOF
 }
 
 check_commit() { # node file is already staged; delete it if merged config is invalid
-  local f=$1 err
+  local f=$1 err n m active=0
+  n=$(basename "$f" .json); m="$META/$n.meta"
+  systemctl is-active --quiet meruru.service && active=1
   err=$(mktemp)
   if ! "$MERURU_BIN" check -c "$MAIN" -C "$CONF" 2>"$err"; then
-    echo -e "${RED}sing-box validation failed; change rolled back:${OFF}"; cat "$err"; rm -f "$f" "$err"; return 1
+    echo -e "${RED}sing-box validation failed; change rolled back:${OFF}"; cat "$err"; rm -f "$f" "$err" "$m" "$MERURU_HOME/certs/$n.crt" "$MERURU_HOME/certs/$n.key"; return 1
   fi
-  rm -f "$err"; restart || { rm -f "$f"; restart >/dev/null 2>&1; die '服务重启失败；已移除新节点并恢复上一配置。'; return 1; }
+  rm -f "$err"
+  if ! restart || ! network_open "$m"; then
+    network_remove_delta "$m" /dev/null || true
+    rm -f "$f" "$m" "$MERURU_HOME/certs/$n.crt" "$MERURU_HOME/certs/$n.key"
+    if [ "$active" = 1 ]; then restart; else systemctl stop meruru.service; fi
+    die '创建失败；已移除新节点并恢复原运行状态。'; return 1
+  fi
   echo -e "${GRN}Saved and started.${OFF}"
+}
+network_open() {
+  local m=$1 t p h
+  [ -s "$m" ] || return 0
+  t=$(jq -r .type "$m"); p=$(jq -r .port "$m"); h=$(jq -r '.hop//empty' "$m")
+  case "$t" in vless-ws) return 0;;hysteria2|tuic) firewall_open udp "$p" || return 1;;shadowsocks|direct) firewall_open tcp "$p" && firewall_open udp "$p" || return 1;;*)firewall_open tcp "$p" || return 1;;esac
+  [ -z "$h" ] || { firewall_open udp "$h" && bash "$HOP"; } || return 1
+  return 0
+}
+network_remove_delta() { # Remove only resources present in old and absent in new.
+  local old=$1 new=$2 t p h np nh
+  [ -s "$old" ] || return 0
+  t=$(jq -r .type "$old"); p=$(jq -r .port "$old"); h=$(jq -r '.hop//empty' "$old")
+  np=$(jq -r '.port//empty' "$new" 2>/dev/null); nh=$(jq -r '.hop//empty' "$new" 2>/dev/null)
+  if [ -n "$h" ] && { [ "$h" != "$nh" ] || [ "$p" != "$np" ]; }; then
+    hop_remove "$h" "$p"
+    [ "$h" = "$nh" ] || firewall_close udp "$h" || return 1
+  fi
+  [ "$p" != "$np" ] || return 0
+  case "$t" in vless-ws) :;;hysteria2|tuic)firewall_close udp "$p";;shadowsocks|direct)firewall_close tcp "$p" && firewall_close udp "$p";;*)firewall_close tcp "$p";;esac
 }
 
 firewall_open() {
-  local proto=$1 p=${2//-/:}
-  if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q 'Status: active'; then ufw allow "$p/$proto" >/dev/null; fi
-  if command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then firewall-cmd --permanent --add-port="$p/$proto" >/dev/null && firewall-cmd --reload >/dev/null; fi
+  local proto=$1 p=$2 ufwp=${2//-/:} ledger="$MERURU_HOME/firewall-owned.tsv" added
+  if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q 'Status: active'; then
+    added=$(ufw show added) || return 1
+    if ! printf '%s\n' "$added" | tr -d "'" | grep -Fq "allow $ufwp/$proto"; then
+      ufw allow "$ufwp/$proto" comment meruru || return 1
+      printf 'ufw\t%s\t%s\n' "$proto" "$p" >>"$ledger"
+    fi
+  fi
+  if command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
+    if ! firewall-cmd --permanent --query-port="$p/$proto" >/dev/null 2>&1; then
+      firewall-cmd --permanent --add-port="$p/$proto" || return 1
+      printf 'firewalld\t%s\t%s\n' "$proto" "$p" >>"$ledger"
+      firewall-cmd --reload || return 1
+    fi
+  fi
+  return 0
 }
 firewall_close() {
-  local proto=$1 p=${2//-/:}
-  if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q 'Status: active'; then ufw delete allow "$p/$proto" >/dev/null 2>&1; fi
-  if command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then firewall-cmd --permanent --remove-port="$p/$proto" >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi
+  local proto=$1 p=$2 ufwp=${2//-/:} ledger="$MERURU_HOME/firewall-owned.tsv" backend
+  [ -f "$ledger" ] || return 0
+  for backend in ufw firewalld; do
+    grep -Fqx "$backend"$'\t'"$proto"$'\t'"$p" "$ledger" || continue
+    case "$backend" in
+      ufw) command -v ufw >/dev/null && ufw delete allow "$ufwp/$proto" || return 1;;
+      firewalld) firewall-cmd --permanent --remove-port="$p/$proto" && firewall-cmd --reload || return 1;;
+    esac
+    awk -F'\t' -v b="$backend" -v p="$p" -v n="$proto" '!($1==b && $2==n && $3==p)' "$ledger" >"$ledger.tmp" && mv "$ledger.tmp" "$ledger"
+  done
+  return 0
 }
 random_free_port() {
   local candidate tries=0
@@ -179,14 +285,28 @@ random_free_port() {
   return 1
 }
 hop_range_free() { # $1 first port, $2 last port: avoid all existing listeners and Hy2 hop ranges.
-  local first=$1 last=$2 m p h hs he
+  local first=$1 last=$2 owner=${3:-} m p h hs he
+  # Extract listener ports separately (ss columns contain addresses, not numbers).
+  while IFS= read -r p; do
+    [ "$p" -lt "$first" ] || [ "$p" -gt "$last" ] || return 1
+  done < <({ ss -H -ltn; ss -H -lun; } 2>/dev/null | awk '{n=split($4,a,":");if(a[n]~/^[0-9]+$/)print a[n]}')
   for m in "$META"/*.meta; do
-    [ -f "$m" ] || continue; p=$(jq -r '.port // 0' "$m")
+    [ -f "$m" ] || continue
+    [ "$m" != "$META/$owner.meta" ] || continue
+    p=$(jq -r '.port // 0' "$m")
     [ "$p" -ge "$first" ] && [ "$p" -le "$last" ] && return 1
     h=$(jq -r '.hop // empty' "$m"); [ -n "$h" ] || continue; IFS=- read -r hs he <<<"$h"
     [ "$first" -le "$he" ] && [ "$last" -ge "$hs" ] && return 1
   done
   return 0
+}
+valid_hop_range() {
+  local h=$1 base=$2 owner=${3:-} first last
+  [ -n "$h" ] || return 0
+  [[ "$h" =~ ^[0-9]{1,5}-[0-9]{1,5}$ ]] || return 1
+  IFS=- read -r first last <<<"$h"
+  first=$((10#$first)); last=$((10#$last))
+  port "$first" && port "$last" && [ "$first" -le "$last" ] && { [ "$base" -lt "$first" ] || [ "$base" -gt "$last" ]; } && hop_range_free "$first" "$last" "$owner"
 }
 random_hop_range() { # A range contains exactly ten UDP ports, inclusive.
   local first last tries=0
@@ -199,8 +319,8 @@ random_hop_range() { # A range contains exactly ten UDP ports, inclusive.
 ask_common() {
   local suggested_name suggested_port
   suggested_name="node-$(openssl rand -hex 3)"; suggested_port=$(random_free_port) || { die '无法自动选择空闲端口。'; return 1; }
-  read -r -p "节点名称 [${suggested_name}]：" NAME; NAME=${NAME:-$suggested_name}; safe_name "$NAME" || return 1; [ ! -e "$CONF/$NAME.json" ] || return 1
-  read -r -p "监听端口 [${suggested_port}]：" PORT; PORT=${PORT:-$suggested_port}; port "$PORT" && ! port_busy "$PORT" || return 1
+  read -r -p "节点名称 [${suggested_name}]：" NAME || return 1; NAME=${NAME:-$suggested_name}; safe_name "$NAME" || return 1; [ ! -e "$CONF/$NAME.json" ] || return 1
+  read -r -p "监听端口 [${suggested_port}]：" PORT || return 1; PORT=${PORT:-$suggested_port}; port "$PORT" && ! port_busy "$PORT" || return 1
 }
 reality_tls() { # private TLS object carries _public only until it is written to a config
   local sn=$1 pair key pub sid; pair=$($MERURU_BIN generate reality-keypair) || return
@@ -710,7 +830,7 @@ sni_view() {
 sni_candidate_manage() {
   local db="$MERURU_HOME/sni-candidates.tsv" choice n confirm d; local -a domains=()
   sni_normalize_db; [ -s "$db" ] || { echo '暂无候选可删除。'; return; }
-  ui_title '删除 SNI 候选'; ui_item 1 '删除单个候选'; ui_item 2 '删除全部候选'; ui_rule; read -r -p '  选择：' choice
+  ui_title '删除 SNI 候选'; ui_item 1 '删除单个候选'; ui_item 2 '删除全部候选'; ui_rule; read -r -p '  选择：' choice || return 0
   case "$choice" in
     1) sni_sort_active
        while IFS=$'\t' read -r d _; do domains+=("$d"); done <"$db"
@@ -752,7 +872,7 @@ sni_scanner_menu() {
     clear
     ui_title 'SNI 工作台'
     echo "  TCP RTT 阈值：≤ ${SNI_MAX_RTT_MS} ms"
-    echo '  需通过：大陆可访问性 · TLS1.3 · H2 · X25519 · SAN · RTT'
+    echo '  技术检测：TLS1.3 · H2 · X25519 · SAN · RTT；屏蔽名单仅辅助筛选'
     echo
     ui_section '发现与导入'
     ui_item 1 '冷门搜索    本地优先 / 可信多源 / 历史复测'
@@ -765,15 +885,16 @@ sni_scanner_menu() {
     ui_item 6 '删除候选    单个 / 全部'
     echo
     ui_section '设置与记录'
-    ui_item 7 '探测设置    RTT 阈值 / 网段探测'
+    ui_item 7 '探测设置    RTT 阈值（自动保存）'
     ui_item 8 '清理归档    单个 / 全部'
     ui_rule
     ui_item 0 '返回主菜单'
     echo
-    read -r -p '> ' x
+    read -r -p '> ' x || return 0
     case "$x" in
       1)sni_institution_discovery;;2)sni_hot_discovery;;3)sni_import;;4)sni_view;;5)sni_revalidate;;6)sni_candidate_manage;;
-      7)ui_title '探测设置'; ui_item 1 "设置 RTT 阈值（当前 ${SNI_MAX_RTT_MS}ms）"; ui_item 2 '授权网段探测'; read -r -p '  选择：' y; if [ "$y" = 1 ]; then read -r -p '新阈值毫秒（5-200）：' y; [[ "$y" =~ ^[0-9]+$ ]] && [ "$y" -ge 5 ] && [ "$y" -le 200 ] && SNI_MAX_RTT_MS=$y || die '阈值无效。'; else [ "$y" = 2 ] && sni_network_notice; fi;;
+      7) read -r -p "RTT 阈值（5–200ms，当前 ${SNI_MAX_RTT_MS}）：" y || return 0
+         if [[ "$y" =~ ^[0-9]+$ ]] && [ "$y" -ge 5 ] && [ "$y" -le 200 ]; then SNI_MAX_RTT_MS=$y; printf '%s\n' "$y" >"$MERURU_HOME/rtt-limit"; else die '阈值无效。'; fi;;
       8)sni_archive_manage;;0)return;;
     esac
     pause
@@ -783,7 +904,7 @@ add_vless() {
   ask_common || { die 'Invalid or duplicate name/port.'; return; }; select_reality_sni || return; local id tls pub sid f
   id=$(uuid); tls=$(reality_tls "$DOMAIN") || return; pub=$(echo "$tls" | jq -r '._public'); sid=$(echo "$tls"|jq -r '.reality.short_id[0]')
   f="$CONF/$NAME.json"; jq -n --arg tag "$NAME" --argjson p "$PORT" --arg id "$id" --argjson tls "$tls" '{inbounds:[{type:"vless",tag:$tag,listen:"::",listen_port:$p,users:[{uuid:$id,flow:"xtls-rprx-vision"}],tls:($tls|del(._public))}]}' >"$f"
-  jq -n --arg name "$NAME" --arg type vless --argjson port "$PORT" --arg uuid "$id" --arg domain "$DOMAIN" --arg pbk "$pub" --arg sid "$sid" '{name:$name,type:$type,port:$port,uuid:$uuid,domain:$domain,pbk:$pbk,sid:$sid}' >"$META/$NAME.meta"; firewall_open tcp "$PORT"; if check_commit "$f"; then show_node "$NAME"; else rm -f "$META/$NAME.meta"; fi
+  jq -n --arg name "$NAME" --arg type vless --argjson port "$PORT" --arg uuid "$id" --arg domain "$DOMAIN" --arg pbk "$pub" --arg sid "$sid" '{name:$name,type:$type,port:$port,uuid:$uuid,domain:$domain,pbk:$pbk,sid:$sid}' >"$META/$NAME.meta"; if check_commit "$f"; then show_node "$NAME"; else rm -f "$META/$NAME.meta"; fi
 }
 require_caddy_domain() {
   echo '  正在读取自有域名配置 …'
@@ -854,7 +975,7 @@ add_trojan() {
   pass=$(openssl rand -hex 16); f="$CONF/$NAME.json"
   jq -n --arg tag "$NAME" --argjson p "$PORT" --arg pass "$pass" --arg d "$TLS_DOMAIN" --arg cert "$TLS_CERT" --arg key "$TLS_KEY" '{inbounds:[{type:"trojan",tag:$tag,listen:"::",listen_port:$p,users:[{password:$pass}],tls:{enabled:true,server_name:$d,certificate_path:$cert,key_path:$key}}]}' >"$f" || return 1
   jq -n --arg name "$NAME" --argjson port "$PORT" --arg password "$pass" --arg domain "$TLS_DOMAIN" '{name:$name,type:"trojan",port:$port,password:$password,domain:$domain}' >"$META/$NAME.meta"
-  if check_commit "$f"; then firewall_open tcp "$PORT"; show_node "$NAME"
+  if check_commit "$f"; then show_node "$NAME"
   else rm -f "$META/$NAME.meta"; return 1; fi
 }
 add_vless_ws() {
@@ -879,7 +1000,7 @@ add_anytls() {
   ask_common || { die 'Invalid or duplicate name/port.'; return; }; select_reality_sni || return; local pass tls sid f
   pass=$(openssl rand -base64 24 | tr -d '=+/\n' | head -c 24); tls=$(reality_tls "$DOMAIN") || return; sid=$(echo "$tls"|jq -r '.reality.short_id[0]'); f="$CONF/$NAME.json"
   jq -n --arg tag "$NAME" --argjson p "$PORT" --arg pass "$pass" --argjson tls "$tls" '{inbounds:[{type:"anytls",tag:$tag,listen:"::",listen_port:$p,users:[{password:$pass}],padding_scheme:["stop=8","0=30-30","1=100-400","2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000","3=9-9,500-1000","4=500-1000","5=500-1000","6=500-1000","7=500-1000"],tls:($tls|del(._public))}]}' >"$f"
-  jq -n --arg name "$NAME" --arg type anytls --argjson port "$PORT" --arg password "$pass" --arg domain "$DOMAIN" --arg pbk "$(echo "$tls" | jq -r '._public')" --arg sid "$sid" '{name:$name,type:$type,port:$port,password:$password,domain:$domain,pbk:$pbk,sid:$sid}' >"$META/$NAME.meta"; firewall_open tcp "$PORT"; if check_commit "$f"; then show_node "$NAME"; else rm -f "$META/$NAME.meta"; fi
+  jq -n --arg name "$NAME" --arg type anytls --argjson port "$PORT" --arg password "$pass" --arg domain "$DOMAIN" --arg pbk "$(echo "$tls" | jq -r '._public')" --arg sid "$sid" '{name:$name,type:$type,port:$port,password:$password,domain:$domain,pbk:$pbk,sid:$sid}' >"$META/$NAME.meta"; if check_commit "$f"; then show_node "$NAME"; else rm -f "$META/$NAME.meta"; fi
 }
 selfcert() { local n=$1; openssl req -x509 -newkey rsa:2048 -nodes -keyout "$MERURU_HOME/certs/$n.key" -out "$MERURU_HOME/certs/$n.crt" -days 3650 -subj '/CN=meruru' >/dev/null 2>&1; }
 add_hy2() {
@@ -890,22 +1011,22 @@ add_hy2() {
   if [ -n "$HOPR" ]; then IFS=- read -r _hop_first _hop_last <<<"$HOPR"; [ "$_hop_first" -ge 1 ] && [ "$_hop_last" -le 65535 ] && [ "$_hop_first" -le "$_hop_last" ] && { [ "$PORT" -lt "$_hop_first" ] || [ "$PORT" -gt "$_hop_last" ]; } && hop_range_free "$_hop_first" "$_hop_last" || { die '跳跃范围无效、包含基础端口或与现有节点冲突。'; return; }; fi
   pass=$(openssl rand -base64 24 | tr -d '=+/\n' | head -c 24); selfcert "$NAME"; f="$CONF/$NAME.json"
   jq -n --arg tag "$NAME" --argjson p "$PORT" --arg pass "$pass" --arg cert "$MERURU_HOME/certs/$NAME.crt" --arg key "$MERURU_HOME/certs/$NAME.key" '{inbounds:[{type:"hysteria2",tag:$tag,listen:"::",listen_port:$p,users:[{password:$pass}],tls:{enabled:true,certificate_path:$cert,key_path:$key}}]}' >"$f"
-  jq -n --arg name "$NAME" --arg type hysteria2 --argjson port "$PORT" --arg password "$pass" --arg hop "$HOPR" '{name:$name,type:$type,port:$port,password:$password,hop:$hop}' >"$META/$NAME.meta"; firewall_open udp "$PORT"; [ -z "$HOPR" ] || firewall_open udp "$HOPR"; if check_commit "$f"; then [ -z "$HOPR" ] || bash "$HOP"; show_node "$NAME"; [ -z "$HOPR" ] || echo -e "${YEL}请同时在云厂商安全组放行 UDP ${HOPR}。${OFF}"; else rm -f "$META/$NAME.meta"; fi
+  jq -n --arg name "$NAME" --arg type hysteria2 --argjson port "$PORT" --arg password "$pass" --arg hop "$HOPR" '{name:$name,type:$type,port:$port,password:$password,hop:$hop}' >"$META/$NAME.meta"; if check_commit "$f"; then show_node "$NAME"; [ -z "$HOPR" ] || echo -e "${YEL}请同时在云厂商安全组放行 UDP ${HOPR}。${OFF}"; else rm -f "$META/$NAME.meta"; fi
 }
 add_tuic() {
   ask_common || { die 'Invalid or duplicate name/port.'; return; }; local id pass f; id=$(uuid); pass=$(openssl rand -base64 18 | tr -d '=+/\n' | head -c 18); selfcert "$NAME"; f="$CONF/$NAME.json"
   jq -n --arg tag "$NAME" --argjson p "$PORT" --arg id "$id" --arg pass "$pass" --arg cert "$MERURU_HOME/certs/$NAME.crt" --arg key "$MERURU_HOME/certs/$NAME.key" '{inbounds:[{type:"tuic",tag:$tag,listen:"::",listen_port:$p,users:[{uuid:$id,password:$pass}],congestion_control:"bbr",zero_rtt_handshake:true,tls:{enabled:true,alpn:["h3"],certificate_path:$cert,key_path:$key}}]}' >"$f"
-  jq -n --arg name "$NAME" --arg type tuic --argjson port "$PORT" --arg uuid "$id" --arg password "$pass" '{name:$name,type:$type,port:$port,uuid:$uuid,password:$password}' >"$META/$NAME.meta"; firewall_open udp "$PORT"; if check_commit "$f"; then show_node "$NAME"; else rm -f "$META/$NAME.meta"; fi
+  jq -n --arg name "$NAME" --arg type tuic --argjson port "$PORT" --arg uuid "$id" --arg password "$pass" '{name:$name,type:$type,port:$port,uuid:$uuid,password:$password}' >"$META/$NAME.meta"; if check_commit "$f"; then show_node "$NAME"; else rm -f "$META/$NAME.meta"; fi
 }
 add_ss() {
   ask_common || { die 'Invalid or duplicate name/port.'; return; }; local pass f; pass=$(openssl rand -base64 16 | tr -d '\n'); f="$CONF/$NAME.json"
   jq -n --arg tag "$NAME" --argjson p "$PORT" --arg pass "$pass" '{inbounds:[{type:"shadowsocks",tag:$tag,listen:"::",listen_port:$p,method:"2022-blake3-aes-128-gcm",password:$pass}]}' >"$f"
-  jq -n --arg name "$NAME" --arg type shadowsocks --argjson port "$PORT" --arg password "$pass" '{name:$name,type:$type,port:$port,password:$password}' >"$META/$NAME.meta"; firewall_open tcp "$PORT"; firewall_open udp "$PORT"; if check_commit "$f"; then show_node "$NAME"; else rm -f "$META/$NAME.meta"; fi
+  jq -n --arg name "$NAME" --arg type shadowsocks --argjson port "$PORT" --arg password "$pass" '{name:$name,type:$type,port:$port,password:$password}' >"$META/$NAME.meta"; if check_commit "$f"; then show_node "$NAME"; else rm -f "$META/$NAME.meta"; fi
 }
 add_tunnel_manual() {
   ask_common || { die 'Invalid or duplicate name/port.'; return; }; read -r -p 'Destination host/IP: ' DST; read -r -p 'Destination port: ' DP; port "$DP" && [ -n "$DST" ] || { die 'Bad destination.'; return; }; local f="$CONF/$NAME.json"
   jq -n --arg tag "$NAME" --argjson p "$PORT" --arg dst "$DST" --argjson dp "$DP" '{inbounds:[{type:"direct",tag:$tag,listen:"::",listen_port:$p,override_address:$dst,override_port:$dp}]}' >"$f"
-  jq -n --arg name "$NAME" --arg type direct --argjson port "$PORT" --arg host "$DST" --argjson target_port "$DP" '{name:$name,type:$type,port:$port,host:$host,target_port:$target_port}' >"$META/$NAME.meta"; firewall_open tcp "$PORT"; firewall_open udp "$PORT"; if check_commit "$f"; then show_node "$NAME"; else rm -f "$META/$NAME.meta"; fi
+  jq -n --arg name "$NAME" --arg type direct --argjson port "$PORT" --arg host "$DST" --argjson target_port "$DP" '{name:$name,type:$type,port:$port,host:$host,target_port:$target_port}' >"$META/$NAME.meta"; if check_commit "$f"; then show_node "$NAME"; else rm -f "$META/$NAME.meta"; fi
 }
 strip_hy2_hopping_query() { # Keep a forwarded Hy2 URI on the line server's one listening port.
   local suffix=$1 query fragment part rebuilt= first=1
@@ -925,7 +1046,7 @@ parse_standard_landing_uri() { # Parses VLESS / AnyTLS / TUIC / Hy2 and retains 
   body=${uri#*://}; nofrag=${body%%\#*}; fragment=
   [ "$nofrag" != "$body" ] && fragment="#${body#*\#}"; authority=${nofrag%%\?*}
   [ "$authority" != "$nofrag" ] && VLESS_SUFFIX="?${nofrag#*\?}${fragment}" || VLESS_SUFFIX="$fragment"
-  [[ "$authority" = *@* ]] || return 1; VLESS_AUTH=${authority%@*}; endpoint=${authority#*@}
+  [[ "$authority" = *@* ]] || return 1; VLESS_AUTH=${authority%@*}; endpoint=${authority#*@}; endpoint=${endpoint%/}
   if [[ "$endpoint" =~ ^\[([^]]+)\]:([0-9]+)(-([0-9]+))?$ ]]; then VLESS_HOST=${BASH_REMATCH[1]}; VLESS_PORT=${BASH_REMATCH[2]}; range=${BASH_REMATCH[4]:-}
   elif [[ "$endpoint" =~ ^([^:]+):([0-9]+)(-([0-9]+))?$ ]]; then VLESS_HOST=${BASH_REMATCH[1]}; VLESS_PORT=${BASH_REMATCH[2]}; range=${BASH_REMATCH[4]:-}
   else return 1; fi
@@ -934,9 +1055,24 @@ parse_standard_landing_uri() { # Parses VLESS / AnyTLS / TUIC / Hy2 and retains 
     port "$range" && [ "$VLESS_PORT" -le "$range" ] || return 1
     LANDING_HY2_RANGE="$VLESS_PORT-$range"
   else LANDING_HY2_RANGE=; fi
+  # Freeze defaults before replacing the original host with the line server.
+  if [[ ! "$VLESS_HOST" = *:* && ! "$VLESS_HOST" =~ ^[0-9.]+$ ]]; then
+    case "$LANDING_SCHEME:$VLESS_SUFFIX" in
+      tuic:*|trojan:*|hysteria2:*|hy2:*|*security=tls*|*security=reality*)
+        if [[ ! "$VLESS_SUFFIX" =~ (^|[\?\&])(sni|peer|servername)= ]]; then
+          uri_add_query "sni=$VLESS_HOST"
+        fi;;
+    esac
+    if [[ "$VLESS_SUFFIX" = *type=ws* ]] && [[ ! "$VLESS_SUFFIX" =~ (^|[\?\&])host= ]]; then uri_add_query "host=$VLESS_HOST"; fi
+  fi
   # mport/ports identify ports on the *landing* server. They must never be copied
   # verbatim to the line server, whose forwarding listener uses another port.
   case "$LANDING_SCHEME" in hysteria2|hy2) VLESS_SUFFIX=$(strip_hy2_hopping_query "$VLESS_SUFFIX");; esac
+}
+uri_add_query() {
+  local value=$1 query=${VLESS_SUFFIX%%\#*} fragment=
+  [[ "$VLESS_SUFFIX" != *\#* ]] || fragment="#${VLESS_SUFFIX#*\#}"
+  if [[ "$query" = \?* ]]; then VLESS_SUFFIX="$query&$value$fragment"; else VLESS_SUFFIX="?$value$fragment"; fi
 }
 build_forwarded_standard() { # $1 scheme, $2 userinfo, $3 suffix, $4 public line address, $5 local forward port
   printf '%s://%s@%s:%s%s\n' "$1" "$2" "$4" "$5" "$3"
@@ -951,7 +1087,6 @@ add_protocol_landing() {
   ask_common || { die '节点名或监听端口无效。'; return; }; f="$CONF/$NAME.json"
   jq -n --arg tag "$NAME" --argjson p "$PORT" --arg dst "$VLESS_HOST" --argjson dp "$VLESS_PORT" '{inbounds:[{type:"direct",tag:$tag,listen:"::",listen_port:$p,override_address:$dst,override_port:$dp}]}' >"$f"
   jq -n --arg name "$NAME" --arg type direct --argjson port "$PORT" --arg host "$VLESS_HOST" --argjson target_port "$VLESS_PORT" --arg scheme "$LANDING_SCHEME" --arg auth "$VLESS_AUTH" --arg suffix "$VLESS_SUFFIX" '{name:$name,type:$type,port:$port,host:$host,target_port:$target_port,landing_scheme:$scheme,landing_auth:$auth,landing_suffix:$suffix}' >"$META/$NAME.meta"
-  firewall_open tcp "$PORT"; firewall_open udp "$PORT"
   if check_commit "$f"; then
     client_link=$(build_forwarded_standard "$LANDING_SCHEME" "$VLESS_AUTH" "$VLESS_SUFFIX" "$(public_ip)" "$PORT")
     echo -e "${GRN}一键落地创建完成。客户端请使用以下线路机入口链接：${OFF}"; echo "$client_link"
@@ -984,7 +1119,7 @@ show_node() {
       echo -e "${YEL}v2rayN 扩展链接（mport）：${OFF}"; echo "$v2link"
     fi
   fi
-  if [ "$type" = vless ]; then jq -n --arg name "$n" --arg server "$(public_ip)" --argjson port "$(jq .port "$m")" --arg uuid "$(jq -r .uuid "$m")" --arg sni "$(jq -r .domain "$m")" --arg fp "$DEFAULT_FP" --arg pbk "$(jq -r .pbk "$m")" --arg sid "$(jq -r .sid "$m")" '{name:$name,type:"vless",server:$server,port:$port,uuid:$uuid,encryption:"none",network:"tcp",tls:true,servername:$sni,"client-fingerprint":$fp,"skip-cert-verify":true,udp:true,flow:"xtls-rprx-vision","reality-opts":{"public-key":$pbk,"short-id":$sid}}'; fi
+  if [ "$type" = vless ]; then jq -n --arg name "$n" --arg server "$(public_ip)" --argjson port "$(jq .port "$m")" --arg uuid "$(jq -r .uuid "$m")" --arg sni "$(jq -r .domain "$m")" --arg fp "$DEFAULT_FP" --arg pbk "$(jq -r .pbk "$m")" --arg sid "$(jq -r .sid "$m")" '{name:$name,type:"vless",server:($server|ltrimstr("[")|rtrimstr("]")),port:$port,uuid:$uuid,encryption:"none",network:"tcp",tls:true,servername:$sni,"client-fingerprint":$fp,"skip-cert-verify":true,udp:true,flow:"xtls-rprx-vision","reality-opts":{"public-key":$pbk,"short-id":$sid}}'; fi
   if [ "$type" = tuic ]; then
     jq --arg server "$(public_ip)" '{name,type:"tuic",server:($server|ltrimstr("[")|rtrimstr("]")),port,uuid,password,sni:"meruru",alpn:["h3"],"skip-cert-verify":true,"congestion-controller":"bbr","udp-relay-mode":"native","reduce-rtt":false,udp:true}' "$m"
     echo "请在云安全组放行 UDP $(jq -r .port "$m")；客户端 ALPN 使用 h3。"
@@ -1025,35 +1160,77 @@ cleanup_node_resources() { # $1 safe node filename; leaves config/meta removal t
 }
 delete_node() {
   local choice confirm n
-  ui_title '删除节点'; ui_item 1 '删除单个节点'; ui_item 2 '删除全部节点'; ui_rule; read -r -p '  选择：' choice
+  ui_title '删除节点'; ui_item 1 '删除单个节点'; ui_item 2 '删除全部节点'; ui_rule; read -r -p '  选择：' choice || return 0
   case "$choice" in
     1) node_picker || return; n=$NODE_SELECTED
        read -r -p "确认删除节点 $(jq -r .name "$META/$n.meta")？[y/N] " confirm; [[ "$confirm" =~ ^[Yy]$ ]] || return
-       cleanup_node_resources "$n"; "$MERURU_BIN" check -c "$MAIN" -C "$CONF" && restart; caddy_ws_sync || return 1; echo '节点已删除。';;
+       delete_nodes_transaction "$n" && echo '节点已删除。';;
     2) [ -n "$(find "$META" -maxdepth 1 -type f -name '*.meta' -print -quit 2>/dev/null)" ] || { echo '暂无节点。'; return; }
        read -r -p '确认删除全部节点？[y/N] ' confirm; [[ "$confirm" =~ ^[Yy]$ ]] || return
-       systemctl stop meruru.service >/dev/null 2>&1 || true
-       for n in "$META"/*.meta; do [ -f "$n" ] || continue; cleanup_node_resources "$(basename "${n%.meta}")"; done
-       "$MERURU_BIN" check -c "$MAIN" -C "$CONF" && restart && caddy_ws_sync && echo '全部节点已删除；MERURU 已恢复为空配置。';;
+       local -a selected=()
+       for n in "$META"/*.meta; do [ -f "$n" ] && selected+=("$(basename "${n%.meta}")"); done
+       delete_nodes_transaction "${selected[@]}" && echo '全部节点已删除。';;
   esac
+}
+delete_nodes_transaction() {
+  local backup n active=0 failed=0
+  backup=$(mktemp -d "$MERURU_HOME/.delete-backup.XXXXXX") || return 1
+  mkdir -p "$backup/conf" "$backup/meta"
+  for n in "$@"; do
+    safe_name "$n" && cp -p "$CONF/$n.json" "$backup/conf/" && cp -p "$META/$n.meta" "$backup/meta/" || { rm -rf "$backup"; die '无法备份节点，未删除。'; return 1; }
+  done
+  systemctl is-active --quiet meruru.service && active=1
+  for n in "$@"; do rm -f "$CONF/$n.json" "$META/$n.meta"; done
+  "$MERURU_BIN" check -c "$MAIN" -C "$CONF" || failed=1
+  if [ "$failed" = 0 ]; then [ "$active" = 0 ] || restart || failed=1; fi
+  if [ "$failed" = 0 ]; then caddy_ws_sync || failed=1; fi
+  if [ "$failed" = 0 ]; then
+    for n in "$@"; do network_remove_delta "$backup/meta/$n.meta" /dev/null || { failed=1; break; }; done
+  fi
+  if [ "$failed" = 1 ]; then
+    for n in "$@"; do cp -p "$backup/conf/$n.json" "$CONF/"; cp -p "$backup/meta/$n.meta" "$META/"; network_open "$META/$n.meta"; done
+    caddy_ws_sync
+    [ "$active" = 0 ] || restart
+    die "删除未完成，已恢复原节点；备份：$backup"; return 1
+  fi
+  for n in "$@"; do rm -f "$MERURU_HOME/certs/$n.crt" "$MERURU_HOME/certs/$n.key"; done
+  # Keep the configuration backup private and available for manual recovery.
+  echo "  删除前配置备份：$backup"
 }
 hop_remove() { local hop=$1 target=$2 range t; range=${hop/-/:}; for t in iptables ip6tables; do command -v "$t" >/dev/null || continue; while "$t" -t nat -C PREROUTING -p udp --dport "$range" -j REDIRECT --to-ports "$target" 2>/dev/null; do "$t" -t nat -D PREROUTING -p udp --dport "$range" -j REDIRECT --to-ports "$target" 2>/dev/null || break; done; done; }
 port_busy() { # $1 port, $2 optional node name whose currently bound port is permitted
-  local p=$1 owner=${2:-} ownp=''
+  local p=$1 owner=${2:-} ownp='' m h first last mp
   [ -n "$owner" ] && [ -f "$META/$owner.meta" ] && ownp=$(jq -r '.port' "$META/$owner.meta")
   [ "$p" = "$ownp" ] && return 1
+  for m in "$META"/*.meta; do
+    [ -f "$m" ] || continue
+    mp=$(jq -r '.port//0' "$m")
+    if [ "$m" != "$META/$owner.meta" ] && [ "$mp" = "$p" ]; then return 0; fi
+    h=$(jq -r '.hop//empty' "$m"); [ -n "$h" ] || continue
+    IFS=- read -r first last <<<"$h"
+    [[ "$first" =~ ^[0-9]+$ && "$last" =~ ^[0-9]+$ ]] || continue
+    [ "$p" -lt "$first" ] || [ "$p" -gt "$last" ] || return 0
+  done
   ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]$p$|\]:$p$" || ss -H -lun 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]$p$|\]:$p$"
 }
 transaction_begin() { TX_NODE=$1; TX_CONF=$(mktemp); TX_META=$(mktemp); cp "$CONF/$1.json" "$TX_CONF" && cp "$META/$1.meta" "$TX_META"; }
 transaction_end() { rm -f "${TX_CONF:-}" "${TX_META:-}"; unset TX_NODE TX_CONF TX_META; }
 update_transaction() { # transaction_begin MUST be called before the caller edits either file
-  local n=$1 f="$CONF/$1.json" m="$META/$1.meta"
+  local n=$1 f="$CONF/$1.json" m="$META/$1.meta" active=0 failed=0 candidate
   [ "${TX_NODE:-}" = "$n" ] && [ -f "${TX_CONF:-}" ] && [ -f "${TX_META:-}" ] || { die '内部事务备份缺失，拒绝保存。'; return 1; }
   if ! "$MERURU_BIN" check -c "$MAIN" -C "$CONF"; then cp "$TX_CONF" "$f"; cp "$TX_META" "$m"; transaction_end; die '校验失败，已恢复原节点。'; return 1; fi
-  if ! restart; then cp "$TX_CONF" "$f"; cp "$TX_META" "$m"; restart >/dev/null 2>&1; transaction_end; die '重启失败，已恢复原节点。'; return 1; fi
-  if [ "$(jq -r .type "$m")" = vless-ws ] && ! caddy_ws_sync; then
-    cp "$TX_CONF" "$f"; cp "$TX_META" "$m"; restart >/dev/null 2>&1
-    transaction_end; die 'Caddy 更新失败，节点已恢复。'; return 1
+  systemctl is-active --quiet meruru.service && active=1
+  [ "$active" = 0 ] || restart || failed=1
+  network_open "$m" || failed=1
+  if [ "$(jq -r .type "$m")" = vless-ws ]; then caddy_ws_sync || failed=1; fi
+  if [ "$failed" = 0 ]; then network_remove_delta "$TX_META" "$m" || failed=1; fi
+  if [ "$failed" = 1 ]; then
+    candidate=$(mktemp); cp "$m" "$candidate"
+    cp "$TX_CONF" "$f"; cp "$TX_META" "$m"
+    network_open "$m"; network_remove_delta "$candidate" "$m"; rm -f "$candidate"
+    [ "$(jq -r .type "$m")" != vless-ws ] || caddy_ws_sync
+    [ "$active" = 0 ] || restart
+    transaction_end; die '更新失败，已恢复节点及相关资源。'; return 1
   fi
   transaction_end; echo -e "${GRN}节点已更新并重启服务。${OFF}"
 }
@@ -1070,9 +1247,10 @@ change_node() {
   ui_rule; ui_item 0 '返回'; read -r -p '  选择：' x
   case "$x" in
    1) read -r -p "新端口（当前 $old）：" new; port "$new" && ! port_busy "$new" "$n" || { transaction_end; die '端口无效或已被其他服务占用。'; return; }
+      [ "$new" != "$old" ] || { transaction_end; echo '端口未变化。'; return 0; }
       jq --argjson p "$new" '.inbounds[0].listen_port=$p' "$f" >"$f.tmp" && mv "$f.tmp" "$f"; jq --argjson p "$new" '.port=$p' "$m" >"$m.tmp" && mv "$m.tmp" "$m"
-      update_transaction "$n" || return; case "$type" in vless-ws) :;; hysteria2|tuic) firewall_open udp "$new"; firewall_close udp "$old";; shadowsocks|direct) firewall_open tcp "$new"; firewall_open udp "$new"; firewall_close tcp "$old"; firewall_close udp "$old";; *) firewall_open tcp "$new"; firewall_close tcp "$old";; esac
-      [ "$type" = hysteria2 ] && { hop_remove "$(jq -r '.hop // empty' "$m")" "$old"; bash "$HOP"; };;
+      update_transaction "$n" || return
+      ;;
    2) case "$type" in
         vless|vless-ws) new=$(uuid); jq --arg v "$new" '.inbounds[0].users[0].uuid=$v' "$f" >"$f.tmp" && mv "$f.tmp" "$f"; jq --arg v "$new" '.uuid=$v' "$m" >"$m.tmp" && mv "$m.tmp" "$m";;
         tuic) new=$(uuid); target=$(openssl rand -base64 18 | tr -d '=+/\n' | head -c 18); jq --arg u "$new" --arg p "$target" '.inbounds[0].users[0].uuid=$u | .inbounds[0].users[0].password=$p' "$f" >"$f.tmp" && mv "$f.tmp" "$f"; jq --arg u "$new" --arg p "$target" '.uuid=$u | .password=$p' "$m" >"$m.tmp" && mv "$m.tmp" "$m";;
@@ -1080,7 +1258,12 @@ change_node() {
         anytls|hysteria2|trojan) new=$(openssl rand -base64 24 | tr -d '=+/\n' | head -c 24); jq --arg p "$new" '.inbounds[0].users[0].password=$p' "$f" >"$f.tmp" && mv "$f.tmp" "$f"; jq --arg p "$new" '.password=$p' "$m" >"$m.tmp" && mv "$m.tmp" "$m";;
         *) transaction_end; die 'Direct Tunnel 没有凭据可更改。'; return;; esac
       update_transaction "$n" && show_node "$n";;
-   3) if [ "$type" = hysteria2 ]; then local oldhop; oldhop=$(jq -r '.hop // empty' "$m"); read -r -p '新范围（如 20000-30000，留空关闭）：' hop; [[ -z "$hop" || "$hop" =~ ^[0-9]{1,5}-[0-9]{1,5}$ ]] || { transaction_end; die '格式错误。'; return; }; jq --arg h "$hop" '.hop=$h' "$m" >"$m.tmp" && mv "$m.tmp" "$m"; update_transaction "$n" || return; [ -z "$oldhop" ] || { firewall_close udp "$oldhop"; hop_remove "$oldhop" "$old"; }; [ -z "$hop" ] || { firewall_open udp "$hop"; bash "$HOP"; };
+   3) if [ "$type" = hysteria2 ]; then
+        read -r -p '新范围（如 20000-20009，留空关闭）：' hop
+        valid_hop_range "$hop" "$old" "$n" || { transaction_end; die '范围无效、重叠或与监听端口冲突。'; return 1; }
+        [ -z "$hop" ] || { IFS=- read -r hs he <<<"$hop"; hop="$((10#$hs))-$((10#$he))"; }
+        jq --arg h "$hop" '.hop=$h' "$m" >"$m.tmp" && mv "$m.tmp" "$m"
+        update_transaction "$n" || return
       elif [ "$type" = direct ]; then read -r -p '新目标主机/IP：' target; read -r -p '新目标端口：' target_port; [ -n "$target" ] && port "$target_port" || { transaction_end; die '目标无效。'; return; }; jq --arg h "$target" --argjson p "$target_port" '.inbounds[0].override_address=$h | .inbounds[0].override_port=$p' "$f" >"$f.tmp" && mv "$f.tmp" "$f"; jq --arg h "$target" --argjson p "$target_port" '.host=$h | .target_port=$p' "$m" >"$m.tmp" && mv "$m.tmp" "$m"; update_transaction "$n";
       elif [ "$type" = vless-ws ]; then
         new="/meruru-$(openssl rand -hex 12)"
@@ -1099,8 +1282,8 @@ uninstall_meruru() {
   local m type p hop t
   echo -e "${YEL}此操作将删除 MERURU 核心、所有节点、证书、元数据及 systemd 服务。${OFF}"
   read -r -p '输入 UNINSTALL 确认：' confirm; [ "$confirm" = UNINSTALL ] || { echo '已取消。'; return; }
-  systemctl disable --now meruru.service >/dev/null 2>&1
-  systemctl disable --now meruru-caddy.service >/dev/null 2>&1
+  systemctl disable --now meruru.service || { die '节点服务未能停止，取消卸载。'; return 1; }
+  if [ -f "$CADDY_SERVICE" ]; then systemctl disable --now meruru-caddy.service || { die 'Caddy 未能停止，取消卸载。'; return 1; }; fi
   for m in "$META"/*.meta; do
     [ -f "$m" ] || continue; type=$(jq -r .type "$m"); p=$(jq -r .port "$m"); hop=$(jq -r '.hop // empty' "$m")
     case "$type" in hysteria2|tuic) firewall_close udp "$p";; *) firewall_close tcp "$p"; firewall_close udp "$p";; esac
@@ -1108,6 +1291,7 @@ uninstall_meruru() {
   done
   firewall_close tcp 80; firewall_close tcp 443
   remove_shortcuts
+  if [ -f "$COMMAND_DIR/meruru-rollback" ] && grep -Fq '# meruru independent recovery' "$COMMAND_DIR/meruru-rollback"; then rm -f "$COMMAND_DIR/meruru-rollback"; fi
   rm -f "$SERVICE" "$CADDY_SERVICE" /usr/local/bin/meruru
   rm -rf "$MERURU_HOME"
   systemctl daemon-reload
@@ -1165,7 +1349,38 @@ caddy_port_conflict() { # Ignore only TCP listeners owned by our running Caddy s
   fi
   [ -n "$listeners" ]
 }
-caddy_self_domain() { # A real HTTPS site on :443 becomes a coherent Reality handshake destination for a domain the user controls.
+caddy_self_domain() {
+  local snapshot active=0 enabled=0 confirm backend proto p
+  if [ -f "$CADDY_DIR/site/index.html" ] && ! grep -Fq '<title>微光 ·' "$CADDY_DIR/site/index.html"; then
+    read -r -p '已有自定义网页，继续配置并允许替换？[y/N] ' confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || return 1
+  fi
+  snapshot=$(mktemp -d "$MERURU_HOME/.caddy-config-backup.XXXXXX") || return 1
+  if [ -d "$CADDY_DIR" ]; then cp -a "$CADDY_DIR" "$snapshot/original" || return 1; fi
+  [ ! -f "$CADDY_SERVICE" ] || cp -p "$CADDY_SERVICE" "$snapshot/service"
+  if [ -f "$MERURU_HOME/firewall-owned.tsv" ]; then cp "$MERURU_HOME/firewall-owned.tsv" "$snapshot/ledger"; else : >"$snapshot/ledger"; fi
+  systemctl is-active --quiet meruru-caddy.service && active=1
+  systemctl is-enabled --quiet meruru-caddy.service && enabled=1
+  if caddy_configure_inner; then
+    sleep 1
+    if systemctl is-active --quiet meruru-caddy.service; then echo "  配置前备份：$snapshot"; return 0; fi
+  fi
+  systemctl stop meruru-caddy.service >/dev/null 2>&1 || true
+  if [ -d "$CADDY_DIR" ]; then mv "$CADDY_DIR" "$snapshot/failed"; fi
+  [ ! -d "$snapshot/original" ] || cp -a "$snapshot/original" "$CADDY_DIR"
+  if [ -f "$snapshot/service" ]; then cp -p "$snapshot/service" "$CADDY_SERVICE"; else rm -f "$CADDY_SERVICE"; systemctl disable meruru-caddy.service >/dev/null 2>&1 || true; fi
+  if [ -f "$MERURU_HOME/firewall-owned.tsv" ]; then
+    awk 'FILENAME==ARGV[1]{seen[$0]=1;next}!seen[$0]' "$snapshot/ledger" "$MERURU_HOME/firewall-owned.tsv" >"$snapshot/new-rules"
+    cp "$snapshot/new-rules" "$MERURU_HOME/firewall-owned.tsv"
+    while IFS=$'\t' read -r backend proto p; do [ -z "$p" ] || firewall_close "$proto" "$p"; done <"$snapshot/new-rules"
+  fi
+  cp "$snapshot/ledger" "$MERURU_HOME/firewall-owned.tsv"
+  systemctl daemon-reload
+  if [ "$enabled" = 1 ]; then systemctl enable meruru-caddy.service; else systemctl disable meruru-caddy.service >/dev/null 2>&1 || true; fi
+  [ "$active" = 0 ] || systemctl start meruru-caddy.service
+  die "Caddy 配置未提交；页面、服务文件、元数据已恢复。备份：$snapshot"
+}
+caddy_configure_inner() { # A real HTTPS site on :443 becomes a coherent Reality handshake destination for a domain the user controls.
   local domain upstream email resolved public_raw mode old_domain staged backup m storage was_running=0
   echo -e "${YEL}偷自己 · 自有域名 HTTPS 回落（Caddy）${OFF}"
   echo '用自己的域名提供真实 HTTPS 站点，作为 VLESS / AnyTLS REALITY 握手目标。'
@@ -1234,7 +1449,7 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
-  firewall_open tcp 80; firewall_open tcp 443
+  firewall_open tcp 80 && firewall_open tcp 443 || return 1
   systemctl daemon-reload; systemctl enable meruru-caddy.service >/dev/null 2>&1
   if { [ "$was_running" = 1 ] && systemctl reload meruru-caddy.service; } || { [ "$was_running" = 0 ] && systemctl start meruru-caddy.service; }; then
     printf '%s\n' "$domain" >"$CADDY_DIR/domain"; printf '%s\n' "$storage" >"$CADDY_DIR/storage-root"; rm -f "$backup"
@@ -1330,8 +1545,9 @@ runtime_menu() {
     ui_item 10 '开启 BBR'
     ui_item 11 'Hysteria2 端口跳跃诊断'
     ui_item 12 '修改快捷命令    当前：'"$(shortcut_name)"
+    [ "${RECOVERY_MODE:-0}" != 1 ] || ui_item 13 '隔离损坏的节点配置（保留文件，不启动服务）'
     ui_rule; ui_item 0 '返回主菜单'
-    read -r -p '  选择：' choice
+    read -r -p '  选择：' choice || return 0
     case "$choice" in
       1) ui_item 1 'MERURU · 节点服务'; ui_item 2 'Caddy · HTTPS / WS / 自动证书'
          read -r -p '  服务 [1]：' target
@@ -1347,10 +1563,26 @@ runtime_menu() {
       7) service_check "$unit" && echo '配置检查通过。';;
       8) journalctl -u "$unit" -n 80 --no-pager;;
       9) service_follow_logs "$unit";;
-      10) enable_bbr;;11) diagnose_hy2;;12)change_shortcut;;0) return;;*) die '无效编号。';;
+      10) enable_bbr;;11) diagnose_hy2;;12)change_shortcut;;13)quarantine_config;;0) return;;*) die '无效编号。';;
     esac
     pause
   done
+}
+quarantine_config() {
+  local f i choice dest base; local -a files=()
+  [ "${RECOVERY_MODE:-0}" = 1 ] || return 1
+  for f in "$CONF"/*.json; do [ -f "$f" ] && files+=("$f"); done
+  [ "${#files[@]}" -gt 0 ] || { die '没有节点分片；请根据检查错误修复主配置，或从备份恢复。'; return 1; }
+  for i in "${!files[@]}"; do ui_item "$((i+1))" "$(basename "${files[$i]}")"; done
+  read -r -p '隔离编号（回车取消）：' choice || return 0
+  [ -n "$choice" ] || return 0
+  [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#files[@]}" ] || return 1
+  f=${files[$((choice-1))]}; base=$(basename "$f" .json)
+  dest=$(mktemp -d "$MERURU_HOME/.quarantine.XXXXXX") || return 1
+  mv "$f" "$dest/" || return 1
+  [ ! -f "$META/$base.meta" ] || mv "$META/$base.meta" "$dest/"
+  echo "已隔离到 $dest，未重启服务。证书保留。"
+  if "$MERURU_BIN" check -c "$MAIN" -C "$CONF"; then RECOVERY_MODE=0; echo '配置恢复有效，可从运行管理启动/重启服务。'; fi
 }
 help_menu() {
   local choice
@@ -1363,7 +1595,7 @@ help_menu() {
     ui_item 5 '连不上时怎么查'
     ui_item 6 '文件位置与常用命令'
     ui_rule; ui_item 0 '返回主菜单'
-    read -r -p '  选择：' choice
+    read -r -p '  选择：' choice || return 0
     case "$choice" in
       1) ui_section '协议与用途'
          echo '  VLESS / AnyTLS REALITY：使用 SNI 候选或自己的 HTTPS 域名。'
@@ -1470,6 +1702,10 @@ install_manager() {
   local source=${BASH_SOURCE[0]} target="$MERURU_HOME/bin/manager"
   [ -f "$source" ] && [ -r "$source" ] || return 0
   if [ "$(readlink -f "$source")" != "$(readlink -f "$target")" ]; then
+    bash -n "$source" || return 1
+    if [ -f "$target" ] && [ "$(sha256sum "$source" | awk '{print $1}')" != "$(sha256sum "$target" | awk '{print $1}')" ]; then
+      cp -p "$target" "$target.previous" || return 1
+    fi
     bash -n "$source" && install -D -m 755 "$source" "$target" || { die '管理命令安装失败。'; return 1; }
   fi
   if { [ -e "$COMMAND_DIR/meruru" ] || [ -L "$COMMAND_DIR/meruru" ]; } && ! shortcut_owned "$COMMAND_DIR/meruru"; then
@@ -1478,6 +1714,30 @@ install_manager() {
   ln -sfnT "$target" "$COMMAND_DIR/meruru" || return 1
   set_shortcut "$(shortcut_name)" || return 1
   if shortcut_owned "$COMMAND_DIR/sbx"; then rm -f "$COMMAND_DIR/sbx"; fi
+  install_recovery_launcher
+}
+install_recovery_launcher() {
+  local launcher="$COMMAND_DIR/meruru-rollback"
+  if [ -e "$launcher" ] && ! grep -Fq '# meruru independent recovery' "$launcher"; then
+    echo '  meruru-rollback 名称已被占用，独立恢复入口未安装。'; return 0
+  fi
+  {
+    printf '#!/usr/bin/env bash\n# meruru independent recovery\nset -u\numask 077\n'
+    printf 'target=%q\n' "$MERURU_HOME/bin/manager"
+    cat <<'RECOVERY'
+[ "$(id -u)" = 0 ] || { echo '请使用 root 执行。' >&2; exit 1; }
+mkdir -p /run/meruru && chmod 700 /run/meruru || exit 1
+exec 9>/run/meruru/manager.lock
+flock -n 9 || { echo '请先退出正在运行的面板。' >&2; exit 1; }
+[ -s "$target.previous" ] && bash -n "$target.previous" || { echo '没有可用的上一版脚本。' >&2; exit 1; }
+temp=$(mktemp "${target}.restore.XXXXXX") || exit 1
+cp "$target.previous" "$temp" && chmod 755 "$temp" && mv -f "$temp" "$target" || { rm -f "$temp"; exit 1; }
+echo '已恢复上一版管理脚本。'
+exec 9>&-
+exec bash "$target"
+RECOVERY
+  } >"$launcher" || return 1
+  chmod 755 "$launcher"
 }
 migration_restore() { # Called only while migrate_legacy_install's local state is in scope.
   systemctl disable --now meruru.service meruru-caddy.service >/dev/null 2>&1 || true
@@ -1495,6 +1755,7 @@ migration_restore() { # Called only while migrate_legacy_install's local state i
 migrate_legacy_install() {
   local old_active=0 old_enabled=0 caddy_active=0 caddy_enabled=0 failed f backup
   [ -f "$LEGACY_HOME/config.json" ] || return 0
+  if [ -f "$LEGACY_HOME/.meruru-migrated" ] || [ -d "$LEGACY_HOME/meruru-migration-backup" ]; then return 0; fi
   [ ! -f "$MAIN" ] || return 0
   [ ! -e "$MERURU_HOME" ] && [ ! -L "$MERURU_HOME" ] || { die '检测到未完成的 meruru 目录，拒绝覆盖；请先检查该目录。'; return 1; }
   [ ! -e "$SERVICE" ] && [ ! -e "$CADDY_SERVICE" ] || { die 'meruru 服务文件已存在，拒绝覆盖迁移。'; return 1; }
@@ -1537,6 +1798,8 @@ migrate_legacy_install() {
   backup="$LEGACY_HOME/meruru-migration-backup"; mkdir -p "$backup"
   [ ! -f "$LEGACY_SERVICE" ] || mv "$LEGACY_SERVICE" "$backup/sbx.service"
   [ ! -f "$LEGACY_CADDY_SERVICE" ] || mv "$LEGACY_CADDY_SERVICE" "$backup/sbx-caddy.service"
+  printf '%s\n' "$(date -Is)" >"$LEGACY_HOME/.meruru-migrated"
+  chmod 700 "$LEGACY_HOME"
   systemctl daemon-reload
   echo -e "${GRN}迁移完成：服务名 meruru / meruru-caddy，原始数据备份未删除。${OFF}"
 }
@@ -1564,7 +1827,7 @@ update_manager() {
 rollback_manager() {
   local target="$MERURU_HOME/bin/manager" tmp
   [ -s "$target.previous" ] || { die '没有可回退的管理脚本备份。'; return 1; }
-  verify_script_candidate "$target.previous" || return 1
+  bash -n "$target.previous" && grep -q '^# meruru - self-contained sing-box manager' "$target.previous" || { die '备份脚本校验失败。'; return 1; }
   tmp=$(mktemp "$MERURU_HOME/bin/.manager-rollback.XXXXXX") || return 1
   cp "$target.previous" "$tmp" && chmod 755 "$tmp" && mv -f "$tmp" "$target" || { rm -f "$tmp"; return 1; }
   echo '  已恢复上一版管理脚本。'; launch_updated_manager
@@ -1618,7 +1881,7 @@ update_menu() {
     ui_item 3 '更新 Caddy      官方稳定版 / 检查反代配置'
     ui_item 4 '回退管理脚本    恢复上一版本'
     ui_rule; ui_item 0 '返回主菜单'
-    read -r -p '  选择：' choice
+    read -r -p '  选择：' choice || return 0
     case "$choice" in 1)update_manager;;2)update_binary core;;3)update_binary caddy;;4)rollback_manager;;0)return;;*)die '无效编号。';;esac
     pause
   done
@@ -1654,8 +1917,10 @@ init() {
   command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ] || { die '此版本需要正在运行的 systemd；不支持原生 OpenRC Alpine 或普通容器。'; return 1; }
   case "$(uname -m)" in x86_64|amd64|aarch64|arm64) :;;*) die '目前仅支持 amd64 / arm64。'; return 1;;esac
   pkg_install || return 1
+  manager_lock || return 1
   migrate_legacy_install || return 1
   mkdir -p "$MERURU_HOME/bin" "$CONF" "$META" "$MERURU_HOME/certs" || return 1
+  secure_state || return 1
   if [ ! -x "$MERURU_BIN" ]; then
     ui_title '安装独立 sing-box 内核'
     download_core || { die '内核下载失败，未进入管理菜单。'; return 1; }
@@ -1667,7 +1932,13 @@ init() {
     ui_title '初始化 MERURU 配置与服务'
     write_base || return 1; fresh=1
   fi
-  "$MERURU_BIN" check -c "$MAIN" -C "$CONF" || { die '现有配置检查失败，请根据上方错误修复；原配置未删除。'; return 1; }
+  write_hop_script || return 1
+  if ! "$MERURU_BIN" check -c "$MAIN" -C "$CONF"; then
+    RECOVERY_MODE=1; echo '  配置检查失败，进入恢复模式：可查看日志、删除坏节点或回退脚本。'
+    install_manager; return 0
+  fi
+  RECOVERY_MODE=0
+  if [ -f "$MERURU_HOME/rtt-limit" ]; then local limit; limit=$(<"$MERURU_HOME/rtt-limit"); [[ "$limit" =~ ^[0-9]+$ ]] && [ "$limit" -ge 5 ] && [ "$limit" -le 200 ] && SNI_MAX_RTT_MS=$limit; fi
   repair_tuic_alpn || return 1
   if [ "$fresh" = 1 ]; then restart || { die 'MERURU 初次启动失败，请查看服务日志。'; return 1; }; fi
   install_manager || return 1
@@ -1704,10 +1975,15 @@ menu() {
   printf '\n'
 }
 main() {
+  umask 077
   need_root
+  if [ "${1:-}" = --rollback ]; then manager_lock && rollback_manager; return $?; fi
   init || { die '安装前置检查未完成，已退出。'; exit 1; }
   while :; do
-    menu; read -r -p '  选择：' c
+    menu; read -r -p '  选择：' c || return 0
+    if [ "${RECOVERY_MODE:-0}" = 1 ]; then
+      case "$c" in 9|11|14|15|16|17|0) :;;*)die '恢复模式暂不允许创建或修改节点，请先修复配置。';pause;continue;;esac
+    fi
     case "$c" in
       1)add_vless;;2)add_anytls;;3)add_hy2;;4)add_tuic;;5)add_ss;;
       6)add_trojan;;7)add_vless_ws;;8)add_tunnel;;9)show_nodes;;

@@ -43,7 +43,7 @@ wget -O /root/meruru https://raw.githubusercontent.com/shinkumiyo/itsmeruru/main
 
 - 云厂商安全组需要自行放行端口；Hysteria2 跳跃范围中的所有 UDP 端口都要放行。
 - Trojan TLS 和 VLESS WS + TLS 需要自己的域名；Caddy 负责自动证书和 HTTPS 站点。
-- SNI 筛查不保证所有国内网络可达，也不保证完全识别第三方 CDN。
+- 冷门和热门 SNI 都使用中国大陆屏蔽名单筛查，并排除已知受到 SNI 屏蔽的 google.com 及其子域名；名单仅作辅助，不保证所有国内网络可达，也不保证完全识别第三方 CDN。
 - 热门候选结合官方页面和官方 IP 范围资料更新，目前仅对 Apple、Google 和 Microsoft 提供网络归属核验；网络归属证据不保证目标服务禁止域前置。
 - 回落过滤默认关闭，仅拒绝不匹配或缺失的明文 SNI；无法检查加密后的 HTTP Host，也不能完全防止利用相同 SNI 的回落流量。已有节点不会自动开启。
 - 节点配置包含密码和密钥，请妥善备份，不要公开上传。

@@ -14,7 +14,7 @@ CADDY_BIN="$MERURU_HOME/bin/caddy"
 CADDY_DIR="$MERURU_HOME/caddy"
 CADDY_SERVICE=/etc/systemd/system/meruru-caddy.service
 COMMAND_DIR=/usr/local/bin
-MERURU_VERSION=1.0.15
+MERURU_VERSION=1.0.16
 UPDATE_URL=https://raw.githubusercontent.com/shinkumiyo/itsmeruru/main/meruru
 LEGACY_HOME=/etc/sbx
 LEGACY_SERVICE=/etc/systemd/system/sbx.service
@@ -1638,7 +1638,19 @@ update_transaction() { # transaction_begin MUST be called before the caller edit
   if [ "$failed" = 0 ] && [ "$(jq -r .type "$m")" = vless-ws ]; then caddy_ws_sync || failed=1; fi
   if [ "$failed" = 0 ]; then network_remove_delta "$TX_META" "$m" || failed=1; fi
   if [ "$failed" = 1 ]; then
-    candidate=$(mktemp) && cp "$m" "$candidate" || { die "无法备份失败配置；原始备份：$TX_CONF 和 $TX_META"; return 1; }
+    if ! candidate=$(mktemp) || ! cp "$m" "$candidate"; then
+      [ -z "${candidate:-}" ] || rm -f "$candidate"
+      # The staged metadata is still available: clean its new resources before restoring it.
+      network_remove_delta "$m" "$TX_META" || rollback_failed=1
+      transaction_restore || return 1
+      network_open "$m" || rollback_failed=1
+      [ "$(jq -r .type "$m")" != vless-ws ] || caddy_ws_sync || rollback_failed=1
+      [ "$active" = 0 ] || restart || rollback_failed=1
+      if [ "$rollback_failed" = 1 ]; then
+        die "无法备份失败配置，回滚未完全成功；原始备份：$TX_CONF 和 $TX_META"; return 1
+      fi
+      die "无法备份失败配置，已恢复原节点；原始备份保留：$TX_CONF 和 $TX_META"; return 1
+    fi
     transaction_restore || { rm -f "$candidate"; return 1; }
     network_open "$m" || rollback_failed=1
     network_remove_delta "$candidate" "$m" || rollback_failed=1

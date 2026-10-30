@@ -1,14 +1,21 @@
 # meruru
 
-单文件 sing-box 交互管理脚本，面向 Debian / Ubuntu，兼容使用 systemd 的常见 RPM 发行版，支持 amd64 / arm64。
+轻量、直观的 sing-box 一键管理脚本。自动安装依赖和内核，使用数字菜单完成节点创建、修改、分享与运行管理。
 
-支持 VLESS / AnyTLS REALITY、Hysteria2 端口跳跃、TUIC、Shadowsocks-2022、Trojan TLS、VLESS WS + TLS，以及一键落地转发、SNI 优选和 Caddy 自有域名站点。
+## 功能
 
-首次以 root 运行脚本，自动检查并安装必要依赖、独立 sing-box 内核和管理命令。之后输入 `M` 或 `m` 打开面板；可在运行管理中更改快捷命令。
+- 多协议：VLESS / AnyTLS REALITY、Hysteria2、TUIC v5、Shadowsocks-2022、Trojan TLS、VLESS WS + TLS。
+- 端口跳跃：Hysteria2 自动配置跳跃范围及转发规则。
+- 一键落地：粘贴节点链接，自动创建转发入口并输出新链接。
+- SNI 优选：热门品牌、当地可信机构、自定义域名，支持延迟检测、历史评分与复测。
+- 自有域名：Caddy 自动证书、HTTPS 反代与内置祝愿墙。
+- 节点管理：编号选择、修改端口与凭据、分享链接、二维码及客户端配置。
+- 运行维护：服务启停、开机自启、配置检查、日志、BBR 与端口跳跃诊断。
+- 在线更新：分别更新管理脚本、sing-box 和 Caddy，支持管理脚本回退。
 
 ## 安装
 
-以 root 运行，任选一种：
+适用 Debian / Ubuntu 及使用 systemd 的常见 RPM 发行版，支持 amd64 / arm64。以 root 运行，任选一种：
 
 ```bash
 curl -fL --retry 3 https://raw.githubusercontent.com/shinkumiyo/itsmeruru/main/meruru -o /root/meruru && bash /root/meruru
@@ -20,18 +27,17 @@ wget -O /root/meruru https://raw.githubusercontent.com/shinkumiyo/itsmeruru/main
 
 安装后输入 `meruru`、`M` 或 `m`。快捷命令可在运行管理中修改。
 
-## 更新与旧版迁移
+## 管理与更新
 
 - 主菜单 **16 → 检查更新**：更新管理脚本、sing-box 或 Caddy；支持回退上一版管理脚本。
 - 更新内核前检查节点配置兼容性；启动失败会尝试恢复旧程序。停止的服务不会因更新而自动启动。
-- 已安装旧版的机器运行上述安装命令，会自动迁移到 `/etc/meruru`，服务名改为 `meruru.service`、`meruru-caddy.service`。
-- 原 `/etc/sbx` 保留为备份，节点端口、密码、UUID 和已有 WS 路径不变。切换正在运行的服务时会有短暂中断；迁移失败会尝试恢复旧服务。
-- 原 `sbx` 下载地址保留兼容安装入口，实际管理程序统一使用 `meruru`。
+- 主菜单 **14 → 运行管理**：管理节点服务和 Caddy，查看状态与日志。
+- 配置目录：`/etc/meruru`；服务名：`meruru.service`、`meruru-caddy.service`。
 
 ## 使用提示
 
 - 云厂商安全组需要自行放行端口；Hysteria2 跳跃范围中的所有 UDP 端口都要放行。
 - Trojan TLS 和 VLESS WS + TLS 需要自己的域名；Caddy 负责自动证书和 HTTPS 站点。
 - SNI 筛查不保证所有国内网络可达，也不保证完全识别第三方 CDN。
-- 节点配置保存在 `/etc/meruru`，包含密码和密钥，请勿公开上传；旧版迁移备份也含同样的敏感信息。
+- 节点配置包含密码和密钥，请妥善备份，不要公开上传。
 - sing-box 与 Caddy 从各自官方 GitHub Releases 下载；本项目不是二者的官方项目。

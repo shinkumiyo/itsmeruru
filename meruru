@@ -14,7 +14,7 @@ CADDY_BIN="$MERURU_HOME/bin/caddy"
 CADDY_DIR="$MERURU_HOME/caddy"
 CADDY_SERVICE=/etc/systemd/system/meruru-caddy.service
 COMMAND_DIR=/usr/local/bin
-MERURU_VERSION=1.0.13
+MERURU_VERSION=1.0.14
 UPDATE_URL=https://raw.githubusercontent.com/shinkumiyo/itsmeruru/main/meruru
 LEGACY_HOME=/etc/sbx
 LEGACY_SERVICE=/etc/systemd/system/sbx.service
@@ -229,14 +229,18 @@ check_commit() { # node file is already staged; delete it if merged config is in
   rm -f "$err"
   [ "$(jq -r .type "$m")" != vless-ws ] || ws=1
   if ! restart || ! network_open "$m" || { [ "$ws" = 1 ] && ! caddy_ws_sync; }; then
-    recovery=$(mktemp -d "$MERURU_HOME/.create-backup.XXXXXX") || { die '创建失败且无法备份临时配置；请检查服务和节点文件。'; return 1; }
-    cp -p "$f" "$m" "$recovery/" || { die "创建失败，无法备份临时配置；请检查：$recovery"; return 1; }
+    recovery=$(mktemp -d "$MERURU_HOME/.create-backup.XXXXXX") || recovery=
+    if [ -n "$recovery" ]; then
+      cp -p "$f" "$m" "$recovery/" || rollback_failed=1
+    else
+      rollback_failed=1
+    fi
     network_remove_delta "$m" /dev/null || rollback_failed=1
     rm -f "$f" "$m" "$MERURU_HOME/certs/$n.crt" "$MERURU_HOME/certs/$n.key" || rollback_failed=1
     [ "$ws" = 0 ] || caddy_ws_sync || rollback_failed=1
     if [ "$active" = 1 ]; then restart || rollback_failed=1; else systemctl stop meruru.service || rollback_failed=1; fi
     if [ "$rollback_failed" = 1 ]; then
-      die "创建失败且回滚未完全成功，请检查服务和防火墙；临时配置备份：$recovery"; return 1
+      die "创建失败且回滚未完全成功，请检查服务和防火墙；临时配置备份：${recovery:-未能创建}"; return 1
     fi
     rm -rf "$recovery"
     die '创建失败；已移除新节点并恢复原运行状态。'; return 1
@@ -420,10 +424,47 @@ sni_dns_cdn_check() { # A brand-owned hostname is not evidence of brand-owned de
   done
   return 2
 }
+sni_cdn_ip_check() { # 0 not in published Cloudflare IPv4 ranges; 1 match; 2 unavailable.
+  local ip=$1 dir="$MERURU_HOME/sni-owner" cache tmp
+  cache="$dir/cloudflare-ipv4.txt"
+  mkdir -p "$dir" || return 2
+  if ! sni_cdn_ranges_valid "$cache" || [ -n "$(find "$cache" -mtime +6 -print 2>/dev/null)" ]; then
+    [ "${SNI_CF_FETCH_FAILED:-0}" = 0 ] || return 2
+    tmp=$(mktemp "$dir/.cloudflare.XXXXXX") || return 2
+    if ! { curl -fsSL --connect-timeout 4 --max-time 10 --max-filesize 65536 https://www.cloudflare.com/ips-v4 -o "$tmp" 2>/dev/null && sni_cdn_ranges_valid "$tmp" && mv "$tmp" "$cache"; }; then
+      rm -f "$tmp"; SNI_CF_FETCH_FAILED=1; return 2
+    fi
+  fi
+  sni_ip_in_prefixes "$ip" "$cache" && return 1
+  return 0
+}
+sni_cdn_ranges_valid() {
+  [ -s "$1" ] && awk '
+    {sub(/\r$/, ""); n=split($0,a,"/"); m=split(a[1],b,".");
+     if(n!=2 || m!=4 || a[2]!~/^[0-9]+$/ || a[2]>32) exit 1;
+     for(i=1;i<=4;i++) if(b[i]!~/^[0-9]+$/ || b[i]>255) exit 1;
+     count++}
+    END {if(count<10) exit 1}' "$1"
+}
+sni_redirect_summary() { # Report only the Location host, never follow it or print credentials/query strings.
+  local hdr=$1 location authority status
+  status=$(awk '/^HTTP\// {status=$2} END {print status}' "$hdr")
+  [[ "$status" =~ ^3[0-9][0-9]$ ]] || return 0
+  location=$(awk 'BEGIN{IGNORECASE=1} /^[Ll][Oo][Cc][Aa][Tt][Ii][Oo][Nn]:/ {sub(/^[^:]*:[[:space:]]*/,""); sub(/\r$/,""); print; exit}' "$hdr")
+  [ -n "$location" ] || return 0
+  case "$location" in
+    http://*|https://*|//*) case "$location" in //*) authority=${location#//};; *) authority=${location#*://};; esac
+      authority=${authority%%/*}; authority=${authority%%\?*}; authority=${authority%%\#*}
+      if [[ "$authority" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]]; then printf '跳转目标主机：%s（未跟随）' "$authority"; else printf '跳转目标不可解析（未跟随）'; fi;;
+    /*) printf '站内相对路径跳转（未跟随）';;
+    *) printf '其他重定向（未跟随）';;
+  esac
+}
 test_sni() { # Three TCP samples (median) gate first, then strict TLS/HTTP screening.
-  local d=$1 official_pool=${2:-} hdr tls cert ms sample start_ns end_ns ip tls13 h2 x25519 san tls_seconds chain_count; local -a samples=()
-  SNI_LAST_RTT=; SNI_LAST_IP=; SNI_LAST_TLS_MS=; SNI_LAST_CHAIN=; [[ "$d" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
+  local d=$1 official_pool=${2:-} hdr tls cert ms sample start_ns end_ns ip tls13 h2 x25519 san tls_seconds chain_count cdn_ip_rc; local -a samples=()
+  SNI_LAST_RTT=; SNI_LAST_IP=; SNI_LAST_TLS_MS=; SNI_LAST_CHAIN=; SNI_LAST_REDIRECT=; [[ "$d" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
   ip=$(getent ahostsv4 "$d" 2>/dev/null | awk 'NR==1{print $1}'); [ -n "$ip" ] || { echo '  DNS 解析失败'; return 1; }
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { echo '  DNS 返回的 IPv4 格式无效'; return 1; }
   hdr=$(mktemp); tls=$(mktemp); cert=$(mktemp)
   # Three fast TCP handshakes give a stable median while still rejecting slow sites before costly TLS work.
   for sample in 1 2 3; do
@@ -441,8 +482,15 @@ test_sni() { # Three TCP samples (median) gate first, then strict TLS/HTTP scree
     [ "$dns_rc" = 1 ] && return 2
     echo '  CDN DNS 检查不可用，暂不入库（安装 dig 可使用本机 DNS 检查）'; return 6
   fi
+  cdn_ip_rc=0; sni_cdn_ip_check "$ip" || cdn_ip_rc=$?
+  if [ "$cdn_ip_rc" != 0 ]; then
+    rm -f "$hdr" "$tls" "$cert"
+    if [ "$cdn_ip_rc" = 1 ]; then echo '  目标 IP 命中 Cloudflare 官方 IPv4 网段'; return 2; fi
+    echo '  Cloudflare 官方网段数据不可用，暂不判定；保留已有记录'; return 6
+  fi
   # Pin HTTP and OpenSSL verification to the same resolved IPv4; do not follow redirects to another host.
   tls_seconds=$(curl -4 -fsSI --http2 --tlsv1.3 --noproxy '*' --resolve "$d:443:$ip" --connect-timeout 2 --max-time 6 -o "$hdr" -w '%{time_appconnect}' "https://$d/" 2>/dev/null) || { rm -f "$hdr" "$tls" "$cert"; echo '  HTTPS / HTTP2 连接失败'; return 1; }
+  SNI_LAST_REDIRECT=$(sni_redirect_summary "$hdr")
   if [[ "$tls_seconds" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
     SNI_LAST_TLS_MS=$(awk -v s="$tls_seconds" 'BEGIN {if (s>0) printf "%.3f", s*1000}')
   fi
@@ -464,6 +512,7 @@ test_sni() { # Three TCP samples (median) gate first, then strict TLS/HTTP scree
   [ "$tls13" = 是 ] && [ "$h2" = 是 ] && [ "$x25519" = 是 ] && [ "$san" = 是 ] || { local diag; diag=$(grep -Ei '(Protocol|ALPN|Temp Key|X25519)' "$tls" | tr '\n' ';' | head -c 300); rm -f "$hdr" "$tls" "$cert"; echo "  条件未全满足：TLS1.3=$tls13，H2=$h2，X25519=$x25519，证书SAN=$san；握手：${diag:-无可读字段}"; return 3; }
   rm -f "$hdr" "$tls" "$cert"; echo "  通过：$d → $ip，TCP RTT 中位数 ${ms} ms（${samples[*]}），证书 SAN 覆盖=是"
   echo "  TLS 建连耗时（单次，含 TCP）：${SNI_LAST_TLS_MS:-未知} ms；服务端发送证书：${SNI_LAST_CHAIN:-未知} 张"
+  [ -z "$SNI_LAST_REDIRECT" ] || echo "  $SNI_LAST_REDIRECT"
   return 0
 }
 sni_archive_begin() {
@@ -537,11 +586,12 @@ sni_history_record() { # Latest result + cumulative counts, bound to the probing
   esac
   [ -s "$db" ] || printf '{}\n' >"$db"
   tmp=$(mktemp)
-  jq --arg d "$d" --arg src "$source" --arg reason "$reason" --arg detail "$detail" --arg scope "${SNI_SCAN_SCOPE:-manual}" --arg rtt "${SNI_LAST_RTT:-}" --arg tls_ms "${SNI_LAST_TLS_MS:-}" --arg chain "${SNI_LAST_CHAIN:-}" --argjson now "$now" --argjson ttl "$ttl" --argjson ok "$([ "$rc" = 0 ] && echo true || echo false)" '
+  jq --arg d "$d" --arg src "$source" --arg reason "$reason" --arg detail "$detail" --arg scope "${SNI_SCAN_SCOPE:-manual}" --arg rtt "${SNI_LAST_RTT:-}" --arg tls_ms "${SNI_LAST_TLS_MS:-}" --arg chain "${SNI_LAST_CHAIN:-}" --arg redirect "${SNI_LAST_REDIRECT:-}" --argjson now "$now" --argjson ttl "$ttl" --argjson ok "$([ "$rc" = 0 ] && echo true || echo false)" '
     .[$d] = ((.[$d] // {passes:0,failures:0}) |
       .passes += (if $ok then 1 else 0 end) | .failures += (if $ok then 0 else 1 end) |
       .last=$now | .retry_after=($now+$ttl) | .reason=$reason | .detail=$detail | .source=$src | .scope=$scope |
       .tls_ms=(if ($tls_ms|length)>0 then ($tls_ms|tonumber) else null end) | .chain_count=(if ($chain|length)>0 then ($chain|tonumber) else null end) |
+      .redirect=(if ($redirect|length)>0 then $redirect else null end) |
       if ($rtt|length)>0 then .rtt_min=([.rtt_min,($rtt|tonumber)]|map(select(.!=null))|min) |
         .rtt_max=([.rtt_max,($rtt|tonumber)]|map(select(.!=null))|max) else . end)' "$db" >"$tmp" && mv "$tmp" "$db"
   rm -f "$tmp"
@@ -552,7 +602,7 @@ sni_cached_failure() {
 }
 sni_history_summary() {
   [ -s "$MERURU_HOME/sni-history.json" ] || return 0
-  jq -r --arg d "$1" '.[$d] | select(.!=null) | "    历史：通过 \(.passes) / 失败 \(.failures) · RTT \(.rtt_min // "—")–\(.rtt_max // "—") ms · 最近 \(.reason)" + (if (.passes+.failures)<3 then " · 样本不足" else "" end) + (if .tls_ms!=null or .chain_count!=null then "\n    最近 TLS 建连（单次，含 TCP）：\(.tls_ms // "—") ms · 服务端证书：\(.chain_count // "—") 张" else "" end)' "$MERURU_HOME/sni-history.json"
+  jq -r --arg d "$1" '.[$d] | select(.!=null) | "    历史：通过 \(.passes) / 失败 \(.failures) · RTT \(.rtt_min // "—")–\(.rtt_max // "—") ms · 最近 \(.reason)" + (if (.passes+.failures)<3 then " · 样本不足" else "" end) + (if .tls_ms!=null or .chain_count!=null then "\n    最近 TLS 建连（单次，含 TCP）：\(.tls_ms // "—") ms · 服务端证书：\(.chain_count // "—") 张" else "" end) + (if .redirect!=null then "\n    \(.redirect)" else "" end)' "$MERURU_HOME/sni-history.json"
 }
 sni_ip_in_prefixes() { # IPv4 membership; paths contain one canonical CIDR per line.
   local ip=$1 file=$2 a b c d num prefix bits net n1 n2 n3 n4 n mask
@@ -632,7 +682,7 @@ sni_hot_owner_check() { # 0 supported official-range evidence, 1 not in range, 2
 sni_probe() { # Explicit selection/revalidation always bypasses discovery's failure cache.
   # Do not call test_sni in $(...) -- that would put SNI_LAST_IP/RTT in a subshell and lose them.
   local d=$1 source=$2 detail rc probe_log listed_risk=0 list="$MERURU_HOME/sni_candidates.txt" result purpose=${SNI_PURPOSE:-"手动/未标注来源"} category=${SNI_CATEGORY:-冷门可信}
-  SNI_LAST_RTT=; SNI_LAST_IP=; SNI_LAST_TLS_MS=; SNI_LAST_CHAIN=
+  SNI_LAST_RTT=; SNI_LAST_IP=; SNI_LAST_TLS_MS=; SNI_LAST_CHAIN=; SNI_LAST_REDIRECT=
   sni_cn_reachability "$d"; rc=$?
   if [ "$rc" = 1 ] && { [ "$source" = popular-owned ] || [ "$source" = popular-verified ] || [ "$source" = import ]; } && sni_hot_listed_allowed "$d"; then listed_risk=1; rc=0; fi
   if [ "$rc" -eq 1 ]; then detail='  中国大陆屏蔽名单或已知 SNI 屏蔽域名命中，未加入候选'; rc=5
@@ -752,6 +802,7 @@ select_or_discover_sni() { # $1 category, $2 user-facing source name, $3 discove
 }
 select_reality_sni() {
   local geo choice own_domain cn_rc
+  unset SNI_CF_FETCH_FAILED
   ui_title '选择 SNI'
   geo=$(curl -fsS --max-time 4 https://ipapi.co/country_name/ 2>/dev/null || true)
   echo "服务器位置：${geo:-未知}。筛查未实测国内网络，建节点后需从国内测试该节点。"
@@ -1194,6 +1245,7 @@ sni_scanner_menu() {
     ui_item 0 '返回主菜单'
     echo
     read -r -p '> ' x || return 0
+    unset SNI_CF_FETCH_FAILED
     case "$x" in
       1)sni_institution_discovery;;2)sni_hot_discovery;;3)sni_import;;4)sni_view;;5)sni_revalidate;;6)sni_candidate_manage;;
       7) read -r -p "RTT 阈值（5–200ms，当前 ${SNI_MAX_RTT_MS}）：" y || return 0

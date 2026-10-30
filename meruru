@@ -14,7 +14,7 @@ CADDY_BIN="$MERURU_HOME/bin/caddy"
 CADDY_DIR="$MERURU_HOME/caddy"
 CADDY_SERVICE=/etc/systemd/system/meruru-caddy.service
 COMMAND_DIR=/usr/local/bin
-MERURU_VERSION=2026.10.30.5
+MERURU_VERSION=2026.10.30.6
 UPDATE_URL=https://raw.githubusercontent.com/shinkumiyo/itsmeruru/main/meruru
 LEGACY_HOME=/etc/sbx
 LEGACY_SERVICE=/etc/systemd/system/sbx.service
@@ -1146,8 +1146,9 @@ add_protocol_landing() {
   if check_commit "$f"; then
     local ip; ip=$(public_ip) || { die '转发已创建，但公网地址识别失败；恢复网络后可从“查看节点”获取链接。'; return 1; }
     client_link=$(build_forwarded_standard "$LANDING_SCHEME" "$VLESS_AUTH" "$VLESS_SUFFIX" "$ip" "$PORT")
-    echo -e "${GRN}一键落地创建完成。客户端请使用以下线路机入口链接：${OFF}"; echo "$client_link"
-    command -v qrencode >/dev/null && qrencode -t ANSIUTF8 "$client_link"
+    echo -e "${GRN}一键落地创建完成。${OFF}"
+    if command -v qrencode >/dev/null; then qrencode -t ANSIUTF8 "$client_link" || true; fi
+    ui_section '线路机入口 · 复制链接'; printf '  %s\n' "$client_link"
   else rm -f "$META/$NAME.meta"; fi
 }
 add_tunnel() {
@@ -1172,12 +1173,11 @@ show_node() {
   local n=$1 m="$META/$1.meta" type link hop v2link ip; [ -f "$m" ] || { die '节点不存在。'; return 1; }; type=$(jq -r .type "$m")
   case "$type" in trojan|vless-ws) ip=;;*) ip=$(public_ip) || return 1;;esac
   link=$(node_link "$n" "$ip") || return 1
-  echo -e "\n${CYA}━━━ $(jq -r .name "$m") · $type ━━━${OFF}"; echo "$link"
+  echo -e "\n${CYA}━━━ $(jq -r .name "$m") · $type ━━━${OFF}"
   if [ "$type" = hysteria2 ]; then
     hop=$(jq -r '.hop // empty' "$m")
     if [ -n "$hop" ]; then
       v2link=$(printf 'hysteria2://%s@%s:%s/?insecure=1&mport=%s#%s' "$(jq -r .password "$m")" "$ip" "$(jq -r .port "$m")" "$hop" "$(jq -r .name "$m")")
-      echo -e "${YEL}v2rayN 扩展链接（mport）：${OFF}"; echo "$v2link"
     fi
   fi
   if [ "$type" = vless ]; then jq -n --arg name "$n" --arg server "$ip" --argjson port "$(jq .port "$m")" --arg uuid "$(jq -r .uuid "$m")" --arg sni "$(jq -r .domain "$m")" --arg fp "$DEFAULT_FP" --arg pbk "$(jq -r .pbk "$m")" --arg sid "$(jq -r .sid "$m")" '{name:$name,type:"vless",server:($server|ltrimstr("[")|rtrimstr("]")),port:$port,uuid:$uuid,encryption:"none",network:"tcp",tls:true,servername:$sni,"client-fingerprint":$fp,"skip-cert-verify":true,udp:true,flow:"xtls-rprx-vision","reality-opts":{"public-key":$pbk,"short-id":$sid}}'; fi
@@ -1192,7 +1192,12 @@ show_node() {
   elif [ "$type" = trojan ]; then
     jq '{name,type:"trojan",server:.domain,port,password,sni:.domain,"skip-cert-verify":false,udp:true}' "$m"
   fi
-  command -v qrencode >/dev/null && qrencode -t ANSIUTF8 "$link"
+  ui_section '扫码导入'
+  if command -v qrencode >/dev/null; then qrencode -t ANSIUTF8 "$link" || echo '  二维码生成失败，可复制下方链接。'; else echo '  未安装 qrencode，可复制下方链接。'; fi
+  ui_section '分享链接 · 长按或选中复制'
+  printf '  %s\n' "$link"
+  if [ -n "${v2link:-}" ]; then printf '\n  v2rayN（mport）\n  %s\n' "$v2link"; fi
+  return 0
 }
 node_picker() { # Prints stable numbered nodes and stores the selected safe filename in NODE_SELECTED.
   local prompt=${1:-'选择节点编号（直接回车取消）：'} i n; local -a files=()
@@ -2046,6 +2051,14 @@ init() {
   ver=$("$MERURU_BIN" version 2>/dev/null) || { die '独立 sing-box 内核无法运行，请检查文件与架构。'; return 1; }
   ver=$(awk 'NR==1{print $3}' <<<"$ver")
   [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] && [ "$(printf '%s\n' 1.12.0 "$ver" | sort -V | head -n1)" = 1.12.0 ] || { die '现有内核版本不支持本脚本，需要 sing-box 1.12 或以上。'; return 1; }
+  if [ ! -f "$MAIN" ] && [ -n "$(find "$CONF" -maxdepth 1 -type f -name '*.json' -print -quit 2>/dev/null)" ]; then
+    RECOVERY_MODE=1; echo '  主配置缺失，已保留现有节点和服务状态；请从备份恢复主配置。'
+    install_manager || return 1; return 0
+  fi
+  if [ -f "$MAIN" ] && [ ! -f "$SERVICE" ]; then
+    RECOVERY_MODE=1; echo '  服务文件缺失，已保留现有配置与服务状态；请先从备份恢复服务文件。'
+    install_manager || return 1; return 0
+  fi
   if [ ! -f "$MAIN" ] || [ ! -f "$SERVICE" ]; then
     ui_title '初始化 MERURU 配置与服务'
     write_base || return 1; fresh=1

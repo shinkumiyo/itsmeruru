@@ -14,7 +14,7 @@ CADDY_BIN="$MERURU_HOME/bin/caddy"
 CADDY_DIR="$MERURU_HOME/caddy"
 CADDY_SERVICE=/etc/systemd/system/meruru-caddy.service
 COMMAND_DIR=/usr/local/bin
-MERURU_VERSION=1.0.12
+MERURU_VERSION=1.0.13
 UPDATE_URL=https://raw.githubusercontent.com/shinkumiyo/itsmeruru/main/meruru
 LEGACY_HOME=/etc/sbx
 LEGACY_SERVICE=/etc/systemd/system/sbx.service
@@ -421,8 +421,8 @@ sni_dns_cdn_check() { # A brand-owned hostname is not evidence of brand-owned de
   return 2
 }
 test_sni() { # Three TCP samples (median) gate first, then strict TLS/HTTP screening.
-  local d=$1 official_pool=${2:-} hdr tls cert ms sample start_ns end_ns ip tls13 h2 x25519 san; local -a samples=()
-  SNI_LAST_RTT=; SNI_LAST_IP=; [[ "$d" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
+  local d=$1 official_pool=${2:-} hdr tls cert ms sample start_ns end_ns ip tls13 h2 x25519 san tls_seconds chain_count; local -a samples=()
+  SNI_LAST_RTT=; SNI_LAST_IP=; SNI_LAST_TLS_MS=; SNI_LAST_CHAIN=; [[ "$d" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
   ip=$(getent ahostsv4 "$d" 2>/dev/null | awk 'NR==1{print $1}'); [ -n "$ip" ] || { echo '  DNS 解析失败'; return 1; }
   hdr=$(mktemp); tls=$(mktemp); cert=$(mktemp)
   # Three fast TCP handshakes give a stable median while still rejecting slow sites before costly TLS work.
@@ -442,9 +442,12 @@ test_sni() { # Three TCP samples (median) gate first, then strict TLS/HTTP scree
     echo '  CDN DNS 检查不可用，暂不入库（安装 dig 可使用本机 DNS 检查）'; return 6
   fi
   # Pin HTTP and OpenSSL verification to the same resolved IPv4; do not follow redirects to another host.
-  curl -4 -fsSI --http2 --tlsv1.3 --resolve "$d:443:$ip" --connect-timeout 2 --max-time 6 "https://$d/" >"$hdr" 2>/dev/null || { rm -f "$hdr" "$tls" "$cert"; echo '  HTTPS / HTTP2 连接失败'; return 1; }
+  tls_seconds=$(curl -4 -fsSI --http2 --tlsv1.3 --noproxy '*' --resolve "$d:443:$ip" --connect-timeout 2 --max-time 6 -o "$hdr" -w '%{time_appconnect}' "https://$d/" 2>/dev/null) || { rm -f "$hdr" "$tls" "$cert"; echo '  HTTPS / HTTP2 连接失败'; return 1; }
+  if [[ "$tls_seconds" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    SNI_LAST_TLS_MS=$(awk -v s="$tls_seconds" 'BEGIN {if (s>0) printf "%.3f", s*1000}')
+  fi
   # Use the identical IPv4 that curl tested.  Do not let OpenSSL silently prefer a broken IPv6 route.
-  if ! timeout 10 openssl s_client -connect "$ip:443" -servername "$d" -alpn h2 -tls1_3 -groups X25519 -verify_hostname "$d" -verify_return_error </dev/null >"$tls" 2>&1; then
+  if ! timeout 10 openssl s_client -connect "$ip:443" -servername "$d" -alpn h2 -tls1_3 -groups X25519 -showcerts -verify_hostname "$d" -verify_return_error </dev/null >"$tls" 2>&1; then
     rm -f "$hdr" "$tls" "$cert"; echo '  TLS 1.3 / X25519 握手或证书链验证失败'; return 3
   fi
   if grep -Eqi '^(server: *(cloudflare|akamaighost|bunnycdn|cdn77)|cf-ray:|x-amz-cf-id:|x-amz-cf-pop:|x-cache:.*cloudfront|x-served-by:.*fastly|via:.*cloudfront)' "$hdr"; then
@@ -455,9 +458,13 @@ test_sni() { # Three TCP samples (median) gate first, then strict TLS/HTTP scree
   # Force the ordinary X25519 group, rather than inferring it from a hybrid negotiation.
   grep -Eqi '(Server Temp Key:.*X25519|Peer Temp Key:.*X25519)' "$tls" && x25519=是 || x25519=否
   sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' "$tls" >"$cert"
+  chain_count=$(grep -c -- '-----BEGIN CERTIFICATE-----' "$tls" || true)
+  [[ "$chain_count" =~ ^[1-9][0-9]*$ ]] && SNI_LAST_CHAIN=$chain_count
   openssl x509 -in "$cert" -noout -checkhost "$d" 2>/dev/null | grep -qi 'does match' && san=是 || san=否
   [ "$tls13" = 是 ] && [ "$h2" = 是 ] && [ "$x25519" = 是 ] && [ "$san" = 是 ] || { local diag; diag=$(grep -Ei '(Protocol|ALPN|Temp Key|X25519)' "$tls" | tr '\n' ';' | head -c 300); rm -f "$hdr" "$tls" "$cert"; echo "  条件未全满足：TLS1.3=$tls13，H2=$h2，X25519=$x25519，证书SAN=$san；握手：${diag:-无可读字段}"; return 3; }
-  rm -f "$hdr" "$tls" "$cert"; echo "  通过：$d → $ip，TCP RTT 中位数 ${ms} ms（${samples[*]}），证书 SAN 覆盖=是"; return 0
+  rm -f "$hdr" "$tls" "$cert"; echo "  通过：$d → $ip，TCP RTT 中位数 ${ms} ms（${samples[*]}），证书 SAN 覆盖=是"
+  echo "  TLS 建连耗时（单次，含 TCP）：${SNI_LAST_TLS_MS:-未知} ms；服务端发送证书：${SNI_LAST_CHAIN:-未知} 张"
+  return 0
 }
 sni_archive_begin() {
   mkdir -p "$MERURU_HOME/sni-archive" || return 1
@@ -530,10 +537,11 @@ sni_history_record() { # Latest result + cumulative counts, bound to the probing
   esac
   [ -s "$db" ] || printf '{}\n' >"$db"
   tmp=$(mktemp)
-  jq --arg d "$d" --arg src "$source" --arg reason "$reason" --arg detail "$detail" --arg scope "${SNI_SCAN_SCOPE:-manual}" --arg rtt "${SNI_LAST_RTT:-}" --argjson now "$now" --argjson ttl "$ttl" --argjson ok "$([ "$rc" = 0 ] && echo true || echo false)" '
+  jq --arg d "$d" --arg src "$source" --arg reason "$reason" --arg detail "$detail" --arg scope "${SNI_SCAN_SCOPE:-manual}" --arg rtt "${SNI_LAST_RTT:-}" --arg tls_ms "${SNI_LAST_TLS_MS:-}" --arg chain "${SNI_LAST_CHAIN:-}" --argjson now "$now" --argjson ttl "$ttl" --argjson ok "$([ "$rc" = 0 ] && echo true || echo false)" '
     .[$d] = ((.[$d] // {passes:0,failures:0}) |
       .passes += (if $ok then 1 else 0 end) | .failures += (if $ok then 0 else 1 end) |
       .last=$now | .retry_after=($now+$ttl) | .reason=$reason | .detail=$detail | .source=$src | .scope=$scope |
+      .tls_ms=(if ($tls_ms|length)>0 then ($tls_ms|tonumber) else null end) | .chain_count=(if ($chain|length)>0 then ($chain|tonumber) else null end) |
       if ($rtt|length)>0 then .rtt_min=([.rtt_min,($rtt|tonumber)]|map(select(.!=null))|min) |
         .rtt_max=([.rtt_max,($rtt|tonumber)]|map(select(.!=null))|max) else . end)' "$db" >"$tmp" && mv "$tmp" "$db"
   rm -f "$tmp"
@@ -544,7 +552,7 @@ sni_cached_failure() {
 }
 sni_history_summary() {
   [ -s "$MERURU_HOME/sni-history.json" ] || return 0
-  jq -r --arg d "$1" '.[$d] | select(.!=null) | "    历史：通过 \(.passes) / 失败 \(.failures) · RTT \(.rtt_min // "—")–\(.rtt_max // "—") ms · 最近 \(.reason)" + (if (.passes+.failures)<3 then " · 样本不足" else "" end)' "$MERURU_HOME/sni-history.json"
+  jq -r --arg d "$1" '.[$d] | select(.!=null) | "    历史：通过 \(.passes) / 失败 \(.failures) · RTT \(.rtt_min // "—")–\(.rtt_max // "—") ms · 最近 \(.reason)" + (if (.passes+.failures)<3 then " · 样本不足" else "" end) + (if .tls_ms!=null or .chain_count!=null then "\n    最近 TLS 建连（单次，含 TCP）：\(.tls_ms // "—") ms · 服务端证书：\(.chain_count // "—") 张" else "" end)' "$MERURU_HOME/sni-history.json"
 }
 sni_ip_in_prefixes() { # IPv4 membership; paths contain one canonical CIDR per line.
   local ip=$1 file=$2 a b c d num prefix bits net n1 n2 n3 n4 n mask
@@ -562,23 +570,19 @@ sni_ip_in_prefixes() { # IPv4 membership; paths contain one canonical CIDR per l
   return 1
 }
 sni_hot_owner_family() {
-  case "${1,,}" in apple.com|*.apple.com|icloud.com|*.icloud.com) echo apple;; google.com|*.google.com|googleapis.com|*.googleapis.com|gstatic.com|*.gstatic.com) echo google;; microsoft.com|*.microsoft.com|office.com|*.office.com|bing.com|*.bing.com|xbox.com|*.xbox.com|surface.com|*.surface.com) echo microsoft;; *) return 1;;esac
+  case "${1,,}" in apple.com|*.apple.com|icloud.com|*.icloud.com) echo apple;; google.com|*.google.com|googleapis.com|*.googleapis.com|gstatic.com|*.gstatic.com) echo google;; microsoft.com|*.microsoft.com|office.com|*.office.com|bing.com|*.bing.com|xbox.com|*.xbox.com|surface.com|*.surface.com) echo microsoft;; tesla.com|*.tesla.com) echo tesla;; intel.com|*.intel.com) echo intel;; nvidia.com|*.nvidia.com) echo nvidia;; hp.com|*.hp.com) echo hp;; cisco.com|*.cisco.com) echo cisco;; *) return 1;;esac
 }
-sni_hot_listed_allowed() { # A parent-only website blocklist hit is ambiguous for known brand hosts.
-  local d=${1,,} root candidate cache="$MERURU_HOME/cn-blocked-domains.txt"
-  d=${d%.}
-  case "$d" in
-    apple.com|*.apple.com) root=apple.com;; icloud.com|*.icloud.com) root=icloud.com;;
-    microsoft.com|*.microsoft.com) root=microsoft.com;; office.com|*.office.com) root=office.com;;
-    bing.com|*.bing.com) root=bing.com;; xbox.com|*.xbox.com) root=xbox.com;;
-    surface.com|*.surface.com) root=surface.com;; *) return 1;;
-  esac
-  candidate=$d
-  while [ "$candidate" != "$root" ]; do
-    grep -Fxi -- "$candidate" "$cache" >/dev/null && return 1
-    candidate=${candidate#*.}
-  done
-  return 0
+sni_hot_listed_allowed() { # Website availability data does not establish SNI censorship.
+  case "$(sni_hot_owner_family "$1")" in apple|microsoft|tesla|intel|nvidia|hp|cisco) return 0;; *) return 1;; esac
+}
+sni_brand_asn_check() { # RIPE RIS route origin: evidence of network operator, not proof of exclusive CDN.
+  local ip=$1 expected=$2 data prefix
+  data=$(curl -fsSG --connect-timeout 4 --max-time 8 --max-filesize 2000000 'https://stat.ripe.net/data/network-info/data.json' --data-urlencode "resource=$ip" 2>/dev/null) || return 2
+  jq -e '.data.asns | type=="array" and length==1 and (.[0]|type=="number")' <<<"$data" >/dev/null 2>&1 || return 2
+  prefix=$(jq -r '.data.prefix // empty' <<<"$data")
+  [[ "$prefix" =~ ^[0-9.]+/[0-9]+$ ]] || return 2
+  sni_ip_in_prefixes "$ip" <(printf '%s\n' "$prefix") || return 2
+  jq -e --argjson a "$expected" '.data.asns[0]==$a' <<<"$data" >/dev/null 2>&1 || return 1
 }
 sni_owner_cache() { # Fresh official provider IP ranges, with no stale fallback.
   local family=$1 dir="$MERURU_HOME/sni-owner" tmp page url
@@ -617,15 +621,20 @@ sni_hot_owner_check() { # 0 supported official-range evidence, 1 not in range, 2
     apple) [[ "$ip" =~ ^17\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1;;
     google) sni_owner_cache google || return 2; sni_ip_in_prefixes "$ip" "$dir/google.txt" || return 1; sni_ip_in_prefixes "$ip" "$dir/google-cloud.txt" && return 1;;
     microsoft) sni_owner_cache microsoft || return 2; sni_ip_in_prefixes "$ip" "$dir/microsoft-firstparty.txt" || return 1;;
+    tesla) sni_brand_asn_check "$ip" 394161 || return $?;;
+    intel) sni_brand_asn_check "$ip" 4983 || return $?;;
+    nvidia) sni_brand_asn_check "$ip" 11414 || return $?;;
+    hp) sni_brand_asn_check "$ip" 33 || return $?;;
+    cisco) sni_brand_asn_check "$ip" 109 || return $?;;
   esac
   return 0
 }
 sni_probe() { # Explicit selection/revalidation always bypasses discovery's failure cache.
   # Do not call test_sni in $(...) -- that would put SNI_LAST_IP/RTT in a subshell and lose them.
   local d=$1 source=$2 detail rc probe_log listed_risk=0 list="$MERURU_HOME/sni_candidates.txt" result purpose=${SNI_PURPOSE:-"手动/未标注来源"} category=${SNI_CATEGORY:-冷门可信}
-  SNI_LAST_RTT=; SNI_LAST_IP=
+  SNI_LAST_RTT=; SNI_LAST_IP=; SNI_LAST_TLS_MS=; SNI_LAST_CHAIN=
   sni_cn_reachability "$d"; rc=$?
-  if [ "$rc" = 1 ] && { [ "$source" = popular-owned ] || [ "$source" = popular-verified ]; } && sni_hot_listed_allowed "$d"; then listed_risk=1; rc=0; fi
+  if [ "$rc" = 1 ] && { [ "$source" = popular-owned ] || [ "$source" = popular-verified ] || [ "$source" = import ]; } && sni_hot_listed_allowed "$d"; then listed_risk=1; rc=0; fi
   if [ "$rc" -eq 1 ]; then detail='  中国大陆屏蔽名单或已知 SNI 屏蔽域名命中，未加入候选'; rc=5
   elif [ "$rc" -eq 2 ]; then detail='  无法取得中国大陆可访问性名单，暂不使用并保留已有记录'; rc=8
   elif [ "$source" = popular-owned ] || [ "$source" = popular-verified ]; then
@@ -634,7 +643,7 @@ sni_probe() { # Explicit selection/revalidation always bypasses discovery's fail
       local owner_rc=0
       sni_hot_owner_check "$d" "$SNI_LAST_IP" || owner_rc=$?
       case "$owner_rc" in 0)source=popular-verified; detail="$detail
-  已匹配官方网络范围（不能保证完全识别 CDN 服务商）";;
+  已匹配品牌网络证据（IP 范围或路由 ASN；不能保证排除所有共享 CDN）";;
         1)rc=2; detail="$detail
   未匹配该品牌的已验证自有网络范围";;
         *)rc=7; detail="$detail
@@ -642,9 +651,19 @@ sni_probe() { # Explicit selection/revalidation always bypasses discovery's fail
     fi
   else
     probe_log=$(mktemp); test_sni "$d" >"$probe_log"; rc=$?; detail=$(<"$probe_log"); rm -f "$probe_log"
+    if [ "$rc" = 0 ] && [ "$listed_risk" = 1 ] && [ "$source" = import ]; then
+      local owner_rc=0
+      sni_hot_owner_check "$d" "$SNI_LAST_IP" || owner_rc=$?
+      case "$owner_rc" in 0) detail="$detail
+  已匹配品牌网络证据（IP 范围或路由 ASN；不能保证排除所有共享 CDN）";;
+        1) rc=2; detail="$detail
+  未匹配该品牌的已验证自有网络范围";;
+        *) rc=7; detail="$detail
+  无法取得或确认自有网络归属，本次不使用，保留已有记录";; esac
+    fi
   fi
   if [ "$listed_risk" = 1 ]; then detail="$detail
-  提示：品牌根域名命中网站屏蔽名单，不能据此确定该主机的 SNI 被拦截；国内连接待实测。"; fi
+  提示：命中网站屏蔽名单，不代表该主机的 SNI 被拦截；国内连接待实测。"; fi
   echo "$detail"
   sni_history_record "$d" "$source" "$rc" "$detail"
   if [ "${SNI_REMOVE_FAILED:-0}" = 1 ] && [ "$rc" -ne 0 ] && [ "$rc" -ne 6 ] && [ "$rc" -ne 7 ] && [ "$rc" -ne 8 ] && [ -s "$MERURU_HOME/sni-candidates.tsv" ]; then
@@ -702,7 +721,7 @@ select_candidate_sni() { # $1 category
     [ "$cn_rc" != 2 ] || { die '大陆屏蔽名单不可用，保留原候选；无法安全筛选，请稍后重试。'; return 2; }
     domains+=("$d")
     ui_item "${#domains[@]}" "$d  · RTT ${rtt}ms"
-    [ "$cn_rc" != 1 ] || echo '      品牌根域名命中网站屏蔽名单；SNI 国内连接待实测。'
+    [ "$cn_rc" != 1 ] || echo '      命中网站屏蔽名单；SNI 国内连接待实测。'
     printf '      %s（%s，%s）\n' "$purpose" "$source" "$ip"
     [ "$source" != popular-owned ] || echo '      旧热门记录：选择后需重新验证官方网络归属。'
     [ "$wanted" != 热门可信 ] || sni_history_summary "$d"
@@ -737,8 +756,8 @@ select_reality_sni() {
   geo=$(curl -fsS --max-time 4 https://ipapi.co/country_name/ 2>/dev/null || true)
   echo "服务器位置：${geo:-未知}。筛查未实测国内网络，建节点后需从国内测试该节点。"
   ui_section '候选库 · 冷门按 RTT / 热门兼顾历史稳定性，选中后复测'
-  ui_item 1 '冷门可信    当地机构与站点'
-  ui_item 2 '热门可信    品牌多入口 / 延迟与稳定性推荐'
+  ui_item 1 '冷门可信    优先 · 当地机构与站点'
+  ui_item 2 '热门可信    备选 · 品牌多入口 / 延迟与稳定性'
   ui_item 3 '自定义域名  选择已导入 / 添加新域名'
   own_domain=$(cat "$CADDY_DIR/domain" 2>/dev/null || true)
   ui_section '自有与手动'
@@ -760,7 +779,7 @@ select_reality_sni() {
     5) read -r -p 'SNI 域名：' DOMAIN
        cn_rc=0; sni_cn_reachability "$DOMAIN" || cn_rc=$?
        if [ "$cn_rc" = 1 ] && sni_hot_listed_allowed "$DOMAIN"; then
-         echo '  品牌根域名命中网站屏蔽名单；该域名 SNI 在国内是否受阻需实测。'
+         echo '  命中网站屏蔽名单；该域名 SNI 在国内是否受阻需实测。'
        elif [ "$cn_rc" != 0 ]; then die '该域名命中屏蔽名单或名单不可用，已取消创建。'; return 1; fi
        test_sni "$DOMAIN" || { die '测试未通过，已取消创建。'; return 1; };;
     *) return 1;; esac
@@ -895,7 +914,7 @@ sni_tranco_search() { # historical function name; Majestic is deliberately the r
 }
 sni_hot_expand_official() { # Only exact approved vendor suffixes; no random rankings or IP scanning.
   local pool=$1 url body host
-  for url in https://www.apple.com/ https://support.apple.com/ https://www.microsoft.com/ https://www.google.com/; do
+  for url in https://www.apple.com/ https://support.apple.com/ https://www.microsoft.com/ https://www.google.com/ https://www.tesla.com/ https://www.intel.com/ https://www.nvidia.com/ https://www.hp.com/ https://www.cisco.com/; do
     body=$(curl -fsSL --connect-timeout 3 --max-time 10 --max-filesize 2000000 "$url" 2>/dev/null) || continue
     while IFS= read -r host; do
       host=${host,,}; sni_hot_owner_family "$host" >/dev/null || continue
@@ -906,11 +925,11 @@ sni_hot_expand_official() { # Only exact approved vendor suffixes; no random ran
 sni_hot_discovery() { # Brand suffix plus official provider IP-range evidence required.
   local item host purpose category source ip rtt verified confirm tested=0 passed=0 total pool cached=0 unsupported=0 passed_file
   echo -e "${YEL}热门可信候选：检测知名企业的官方入口，不使用随机排名站点或来源不明域名。${OFF}"
-  echo '排除 Google 已知 SNI 屏蔽域名；Apple/Microsoft 仅品牌根域名命中时标记风险并继续检测。'
+  echo '排除 Google 已知 SNI 屏蔽域名；部分品牌网站名单命中时标记风险并继续检测。'
   echo '仍需通过 TLS、H2、X25519、第三方 CDN 与 RTT 筛查。'
   echo '推荐综合三次握手中位数、历史通过/失败次数和延迟波动；新域名标记为样本不足。'
-  echo '仅接受 Apple、Google 和 Microsoft 中可匹配官方网络范围的入口；其他品牌暂不作归属保证。'
-  echo '官方 IP 范围是归属证据，并不能证明完全不存在共享 CDN 或域名前置。'
+  echo 'Apple / Google / Microsoft 使用网络范围核验；Tesla / Intel / NVIDIA / HP / Cisco 使用 RIPE 路由 ASN 核验。'
+  echo '网络证据不能证明完全不存在共享 CDN 或域名前置；用途描述不是流量画像保证。'
   echo '屏蔽名单不等于国内实测；建节点后请在实际国内网络测试连接。'
   read -r -p '确认开始扫描？[Y/n] ' confirm || return 1; [[ -z "$confirm" || "$confirm" =~ ^[Yy]$ ]] || return; sni_archive_begin popular-owned || return 1
   SNI_SCAN_SCOPE="popular/$(public_ip)"
@@ -925,6 +944,12 @@ support.microsoft.com	Microsoft 官方支持中心
 www.apple.com	Apple 官方网站
 apple.com	Apple 官方网站根域名
 www.icloud.com	Apple iCloud 官方入口
+icloud.com	Apple iCloud 官方入口
+gateway.icloud.com	Apple iCloud 网关入口（具体支持与流量用途需核实）
+setup.icloud.com	Apple iCloud 设备配置入口
+swscan.apple.com	Apple 软件更新目录服务
+swcdn.apple.com	Apple 软件更新下载服务
+mesu.apple.com	Apple 软件更新服务
 itunes.apple.com	Apple iTunes 官方服务
 support.apple.com	Apple 官方支持中心
 www.tesla.com	Tesla 官方网站
@@ -1153,8 +1178,8 @@ sni_scanner_menu() {
     echo '  国内可达性未实测：请在实际国内网络测试建好的节点。'
     echo
     ui_section '发现与导入'
-    ui_item 1 '冷门搜索    本地优先 / 可信多源 / 历史复测'
-    ui_item 2 '热门搜索    官方品牌站点'
+    ui_item 1 '冷门搜索    优先 · 本地可信多源 / 历史复测'
+    ui_item 2 '热门搜索    备选 · 官方品牌站点'
     ui_item 3 '自定义导入  直接粘贴多个域名'
     echo
     ui_section '候选管理'

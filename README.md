@@ -43,7 +43,7 @@ wget -O /root/meruru https://raw.githubusercontent.com/shinkumiyo/itsmeruru/main
 
 - 云厂商安全组需要自行放行端口；Hysteria2 跳跃范围中的所有 UDP 端口都要放行。
 - Trojan TLS 和 VLESS WS + TLS 需要自己的域名；Caddy 负责自动证书和 HTTPS 站点。
-- 冷门和热门 SNI 都使用中国大陆屏蔽名单筛查，并保守排除有 SNI 屏蔽风险的 google.com、apple.com 及其子域名；名单仅作辅助，不保证所有国内网络可达，也不保证完全识别第三方 CDN。
+- 冷门和热门 SNI 使用中国大陆网站屏蔽名单辅助筛查；已知存在 SNI 屏蔽的 google.com 及其子域名排除。热门 Apple / Microsoft 仅品牌根域名命中时提示风险并继续检测；具体子域名或中间域名命中仍会排除，名单命中不等于 SNI 必然被拦截。
 - VPS 上的探测不能证明国内 SNI 可达。请从实际使用的国内网络测试建好的节点；浏览器能否打开网站也不能代替节点测试。列表中的旧候选不会在更新时自动删除。
 - 热门候选结合官方页面和官方 IP 范围资料更新，目前仅对 Apple、Google 和 Microsoft 提供网络归属核验；网络归属证据不保证目标服务禁止域前置。
 - 回落过滤默认关闭，仅拒绝不匹配或缺失的明文 SNI；无法检查加密后的 HTTP Host，也不能完全防止利用相同 SNI 的回落流量。已有节点不会自动开启。

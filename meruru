@@ -14,7 +14,7 @@ CADDY_BIN="$MERURU_HOME/bin/caddy"
 CADDY_DIR="$MERURU_HOME/caddy"
 CADDY_SERVICE=/etc/systemd/system/meruru-caddy.service
 COMMAND_DIR=/usr/local/bin
-MERURU_VERSION=1.0.14
+MERURU_VERSION=1.0.15
 UPDATE_URL=https://raw.githubusercontent.com/shinkumiyo/itsmeruru/main/meruru
 LEGACY_HOME=/etc/sbx
 LEGACY_SERVICE=/etc/systemd/system/sbx.service
@@ -747,10 +747,10 @@ sni_recommended_rows() { # Sorted view only: keep the on-disk candidate schema u
   fi
   # Smoothed failure penalty (0–20 ms) + observed spread penalty (at most 5 ms).
   # Few measurements deliberately retain uncertainty rather than claiming 100% stability.
-  awk -F'\t' 'BEGIN{OFS="\t"}
+  awk -F'\t' -v force_hot="${1:-}" 'BEGIN{OFS="\t"}
     FILENAME==ARGV[1] {p[$1]=$2;f[$1]=$3;spread[$1]=$5-$4;next}
     {penalty=20*(f[$1]+1)/(p[$1]+f[$1]+2); jitter=spread[$1];if(jitter>5)jitter=5;
-     score=($2=="热门可信" ? $6+penalty+jitter : $6);print score,$0}' "$hist" "$db" |
+     score=((force_hot=="hot" || $2=="热门可信") ? $6+penalty+jitter : $6);print score,$0}' "$hist" "$db" |
     sort -t$'\t' -k1,1n -k7,7n -k2,2 | cut -f2-
   rm -f "$hist"
 }
@@ -1111,12 +1111,11 @@ EOF
   sni_sort_active
   echo -e "${GRN}完成：实测 $tested，合格 $passed，缓存跳过 $cached。以下按延迟与历史稳定性推荐：${OFF}"
   while IFS=$'\t' read -r host category source purpose ip rtt verified; do
-    [ "$category" = 热门可信 ] && [ "$source" = popular-verified ] || continue
     grep -Fqx "$host" "$passed_file" || continue
     printf '  %s · %sms · %s\n' "$host" "$rtt" "$purpose"
     sni_cn_reachability "$host" || echo '    名单命中：SNI 是否受阻需在国内实测。'
     sni_history_summary "$host"
-  done < <(sni_recommended_rows)
+  done < <(sni_recommended_rows hot)
   rm -f "$passed_file"
 }
 sni_import() {

@@ -35,6 +35,7 @@ wget -O /root/meruru https://raw.githubusercontent.com/shinkumiyo/itsmeruru/main
 - 配置目录：`/etc/meruru`；服务名：`meruru.service`、`meruru-caddy.service`。
 - 配置损坏时进入恢复模式，可查看日志、隔离节点配置；`meruru-rollback` 可独立回退上一版管理脚本。
 - 管理操作使用单会话锁，避免多个 SSH 面板同时修改节点；RTT 阈值会自动保存。
+- 节点保存时同时核对配置和分享信息；删除前备份配置与自签证书，规则清理失败会保留数据供重试。
 
 ## 使用提示
 
@@ -43,4 +44,5 @@ wget -O /root/meruru https://raw.githubusercontent.com/shinkumiyo/itsmeruru/main
 - SNI 筛查不保证所有国内网络可达，也不保证完全识别第三方 CDN。
 - 节点配置包含密码和密钥，请妥善备份，不要公开上传。
 - 防火墙自动清理仅针对新版记录的自有规则；旧版无归属记录的规则会保守保留，需自行检查整理。
+- firewalld 分别更新运行和持久规则，避免全量重载影响端口跳跃；UFW 已有的等价规则不会被认领删除。
 - sing-box 与 Caddy 从各自官方 GitHub Releases 下载；本项目不是二者的官方项目。
